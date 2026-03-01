@@ -1,0 +1,27 @@
+# 데이터베이스 — protein_data.db는 GitHub 배포 전략상 추적 대상
+# (로컬에서 데이터 수집 후 GitHub에 푸시 → Streamlit Cloud에서 읽기 전용 사용)
+# protein_data.db  ← 주석 처리: GitHub에 올려야 함
+
+# API 캐시 파일
+protein_api_cache.sqlite
+
+# Python 캐시
+__pycache__/
+*.py[cod]
+*$py.class
+
+# 환경 설정 (로컬 전용 — 절대 GitHub에 올리지 말 것)
+.env
+*.env
+
+# Streamlit Secrets (실제 키 파일 — 절대 GitHub에 올리지 말 것)
+.streamlit/secrets.toml
+
+# VS Code 설정
+.vscode/
+
+# macOS 시스템 파일
+.DS_Store
+
+# 논문 PDF (저작권 — GitHub에 올리지 말 것)
+papers/*.pdf
