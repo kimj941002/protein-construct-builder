@@ -192,3 +192,149 @@ except Exception as e:
 > 항상 `pypdf` 텍스트 추출 fallback을 함께 구현한다.
 
 ---
+
+## ERROR-007: normalize_gene_name 정규식 버그
+
+**발생 파일:** `uniprot_fetcher.py` — `normalize_gene_name()`
+**출처:** Feedback_v1.3.md (Critical C-1)
+**발생 일시:** 2026-02-28 (설계 단계)
+
+### 오류 내용
+정규식 `r'^[cp]-?'`에서 `-?` (하이픈 선택적)로 인해 `c` 또는 `p`로 시작하는 모든 gene name의 첫 글자가 제거됨.
+
+| 입력 | 잘못된 결과 | 올바른 결과 |
+|------|-----------|-----------|
+| `"CREB1"` | `"REB1"` | `"CREB1"` |
+| `"CDK2"` | `"DK2"` | `"CDK2"` |
+| `"p53"` | `"53"` | `"TP53"` |
+| `"PDGFRB"` | `"DGRFB"` | `"PDGFRB"` |
+
+### 원인
+`re.sub(r'^[cp]-?', '', ...)` — `-?`는 하이픈을 optional로 만들어 `c-` 뿐 아니라 `c`(하이픈 없음)도 제거 대상이 됨.
+
+### 해결 방법
+```python
+# 안전한 방식: 정규식 대신 explicit GENE_ALIASES whitelist 사용
+GENE_ALIASES = {
+    'C-MET': 'MET', 'CMET': 'MET',
+    'P-EGFR': 'EGFR', 'PEGFR': 'EGFR',
+    'HER2': 'ERBB2', 'HER3': 'ERBB3', 'HER4': 'ERBB4',
+    'VEGFR1': 'FLT1', 'VEGFR2': 'KDR', 'VEGFR3': 'FLT4',
+    'PDGFR-ALPHA': 'PDGFRA', 'PDGFR-BETA': 'PDGFRB',
+    # 'FGFR': 'FGFR1' ← 제거: 모호한 별칭, FGFR1~4 중 하나를 임의 선택하는 문제
+}
+
+def normalize_gene_name(user_input):
+    name = user_input.strip().upper().replace('-', '')
+    return GENE_ALIASES.get(name, user_input.strip().upper())
+```
+
+### 예방 규칙
+> **gene name 정규화에 `^[cp]-?` 같은 선택적 문자 제거 정규식을 사용하지 않는다.**
+> GENE_ALIASES dict를 사용하는 explicit whitelist 방식만 사용한다.
+> 모호한 별칭 (FGFR → FGFR1처럼 family를 특정 gene으로 임의 매핑)은 aliases에 등록하지 않는다.
+
+---
+
+## ERROR-008: requests-cache + ThreadPoolExecutor 스레드 안전성 결함
+
+**발생 파일:** `pdb_fetcher.py`
+**출처:** Feedback_v1.3.md (Critical C-2)
+**발생 일시:** 2026-02-28 (설계 단계)
+
+### 오류 내용
+```
+InterfaceError: bad parameter or other API misuse  (Python 3.12+)
+# 또는 segfault (GitHub issue #1008, #845)
+```
+
+### 원인
+`requests_cache.install_cache()` 전역 패치는 단일 SQLite 연결을 공유함.
+`ThreadPoolExecutor`에서 여러 스레드가 동시에 이 연결에 접근하면 SQLite의 스레드 제한에 위반.
+
+### 해결 방법
+각 스레드 함수 내부에서 `CachedSession`을 독립 생성:
+```python
+def fetch_single_pdb(pdb_id):
+    with requests_cache.CachedSession(
+        'protein_api_cache',
+        expire_after=604800,
+        allowable_codes=(200,)   # 429, 500 등은 캐싱 방지
+    ) as session:
+        resp = session.get(f"{RCSB_ENTRY_API}/{pdb_id}", timeout=30)
+        ...
+```
+
+### 예방 규칙
+> **`requests_cache.install_cache()` 전역 패치와 `ThreadPoolExecutor` 병렬 처리를 함께 사용하지 않는다.**
+> 멀티스레드 환경에서는 반드시 각 스레드 함수 내부에서 `CachedSession`을 개별 생성한다.
+> `allowable_codes=(200,)` 항상 명시: rate limit(429) 응답이 캐싱되면 재시도 시에도 캐시된 429가 반환됨.
+
+---
+
+## ERROR-009: DOI 필드명 대소문자 오류
+
+**발생 파일:** `pdb_fetcher.py`
+**출처:** Feedback_v1.3.md (Moderate M-1)
+**발생 일시:** 2026-02-28 (설계 단계)
+
+### 오류 내용
+RCSB Entry API 응답에서 DOI를 찾지 못해 항상 '해당없음'으로 저장됨.
+
+### 원인
+계획서에 `rcsb_primary_citation.pdbx_database_id_DOI` (대문자 DOI)로 기술되었으나,
+실제 RCSB API 응답 필드명은 다름:
+```json
+"citation": [{"pdbx_database_id_doi": "10.1021/..."}]
+```
+- 키는 `pdbx_database_id_doi` (소문자 doi)
+- 위치는 `citation` 배열의 [0], `rcsb_primary_citation`이 아님
+
+### 해결 방법
+```python
+entry_data = api_call_with_retry(f"{RCSB_ENTRY_API}/{pdb_id}")
+citations = entry_data.get('citation', [])
+doi = citations[0].get('pdbx_database_id_doi', '해당없음') if citations else '해당없음'
+```
+
+### 예방 규칙
+> **RCSB API DOI 필드명: `citation[0].pdbx_database_id_doi` (소문자 doi, citation 배열의 첫 원소)**
+> Python dict key는 대소문자 구별함. API 응답을 실제로 출력하여 필드명을 확인한 후 사용.
+
+---
+
+## ERROR-010: st.dataframe 행 선택 인덱스 불일치
+
+**발생 파일:** `app.py`
+**출처:** Feedback_v1.3.md (Moderate M-7)
+**발생 일시:** 2026-02-28 (설계 단계)
+
+### 오류 내용
+정렬/필터링 후 행 선택 시 엉뚱한 데이터가 상세 패널에 표시됨.
+
+### 원인
+```python
+selected_pdb = pdb_df.iloc[selected_row]  # 위험
+```
+`event.selection.rows`는 화면에 **표시된 순서** 기준 인덱스를 반환함.
+DataFrame이 사용자에 의해 정렬/필터링되면 `iloc` 인덱스와 화면 인덱스가 불일치.
+
+### 해결 방법
+```python
+# 표시 전 reset_index 필수
+pdb_df_display = pdb_df.reset_index(drop=True)
+
+event = st.dataframe(
+    pdb_df_display,
+    on_select="rerun",
+    selection_mode="single-row"
+)
+
+if event.selection.rows:
+    selected_row = event.selection.rows[0]
+    selected_pdb = pdb_df_display.iloc[selected_row]  # reset_index 이후라 안전
+```
+
+### 예방 규칙
+> **`st.dataframe(on_select="rerun")` 사용 시 반드시 표시 전에 `df.reset_index(drop=True)` 적용.**
+> `event.selection.rows`는 화면 표시 순서 기준이므로 원본 DataFrame 인덱스와 다를 수 있음.
