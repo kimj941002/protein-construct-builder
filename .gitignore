@@ -5,6 +5,9 @@
 # API 캐시 파일
 protein_api_cache.sqlite
 
+# AI 채팅 기록 (런타임 생성 파일 — GitHub에 올리지 말 것)
+chat_history.json
+
 # Python 캐시
 __pycache__/
 *.py[cod]
