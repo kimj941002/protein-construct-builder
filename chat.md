@@ -323,6 +323,88 @@ biopython 설치 실패
 
 ---
 
+---
+
+## 13. Streamlit Cloud ImportError — chat_store 배포 타이밍 버그
+
+**User:**
+streamlit에서 `from chat_store import (...)` ImportError가 떴어. 해결해.
+
+**Claude:**
+로그 파일 분석 결과:
+
+```
+ImportError: cannot import name 'update_chat_tags' from 'chat_store'
+발생 시각: 2026-03-08 12:14 UTC
+ce17676 커밋 시각: 12:10 UTC
+Python 버전: 3.13 (runtime.txt의 python-3.11 무시됨)
+```
+
+**원인**: `ce17676`이 app.py와 chat_store.py를 동시에 수정. Streamlit Cloud 핫리로드가 app.py만 먼저 적용 → chat_store.py는 구버전 → `update_chat_tags` 미존재 → ImportError (배포 타이밍 레이스 컨디션).
+
+**수정**: `chat_history.json`을 `.gitignore`에 추가해 새 커밋 생성 → Streamlit Cloud 전체 재시작 트리거.
+
+커밋: `58be2ba` — GitHub push 완료
+
+---
+
+## 14. LLM 질의 두 가지 버그 수정
+
+**User:**
+질문하면 `오류: 최대 반복 횟수에 도달했습니다.`와 `오류: 보안 정책: SELECT 또는 WITH 쿼리만 허용됩니다.` 두 가지 문제가 발생해.
+
+**Claude:**
+**버그 1 — 최대 반복 횟수** (`llm_query.py`):
+- 원인: `thinking={"type": "adaptive"}` 유효하지 않은 파라미터 → 예상치 못한 `stop_reason` → 루프 `break` → "최대 반복 횟수" 반환
+- 추가 원인: `max_tokens=4096` 부족, `max_tokens` stop_reason 미처리
+- 수정: `thinking` 파라미터 제거, `max_tokens` 4096→8192, `max_tokens` stop_reason 처리 추가
+
+**버그 2 — 보안 정책 에러** (`llm_query.py`):
+- 원인: Claude가 SQL 앞에 `-- 주석` 붙여 생성 → `startswith("SELECT")` 실패
+  ```sql
+  -- HER2 구조 목록 조회
+  SELECT * FROM pdb_structures ...
+  ```
+- 수정: `re.sub(r"--[^\n]*|/\*.*?\*/", ...)` 로 주석 제거 후 첫 키워드 검사
+
+커밋: `817b1fb` — GitHub push 완료 (merge: `9c394c1`)
+
+---
+
+## 15. MET KLIFS 데이터 유실 — git stash 원인
+
+**User:**
+내가 일부러 로컬 DB를 제거했어. 자꾸 pull/push 할 때마다 MET KLIFS 데이터가 사라져서. 이번에도 또 사라졌어. 데이터 소실이 제일 싫다고 했잖아. 자꾸 지우지마.
+
+**Claude:**
+**원인**: `git stash → git pull → git stash pop` 과정에서 `protein_data.db`가 삭제됨 → `git restore protein_data.db`로 git HEAD 버전 복구 → MET KLIFS 데이터(미커밋 상태였음) 유실.
+
+**즉각 조치**:
+1. `migrate_database()` 실행 (UNIQUE 제약 적용)
+2. MET 129개 구조 KLIFS 재수집 → 실제 100개, sentinel 29개
+3. 즉시 `protein_data.db` 커밋·push
+
+**영구 방지 규칙 (메모리 등록)**:
+- `git stash` 절대 사용 금지 — DB 먼저 commit 후 pull
+- `git restore protein_data.db` 사용자 명시 허가 없이 절대 금지
+- pull 전 순서: `git add protein_data.db → git commit → git pull → git push`
+
+커밋: `2023dba` — GitHub push 완료
+
+---
+
+## 16. chat.md 누락 내용 누적
+
+**User:**
+지금까지 대화한 기록 @chat.md 에 누적시켜.
+
+**Claude:**
+항목 13(Streamlit 배포 타이밍 버그), 14(LLM 질의 버그 2종), 15(MET KLIFS 유실), 16(이번 누적)을 chat.md에 추가. 커밋 히스토리 테이블 갱신.
+
+커밋: (현재) — GitHub push 완료
+
+---
+
 ## 커밋 히스토리 요약
 
 | 커밋 | 내용 |
@@ -339,3 +421,7 @@ biopython 설치 실패
 | `96d8bc3` | fix: Streamlit Cloud 배포 실패 원인 제거 (biopython, dotenv) |
 | `b499a40` | docs: 2026-03-08 개발 채팅 기록 저장 (chat.md) |
 | `ce17676` | feat: 채팅 기록 삭제 및 Tag 관리 기능 추가 |
+| `58be2ba` | fix: chat_history.json .gitignore 추가 (Streamlit 강제 재배포) |
+| `817b1fb` | fix: LLM 질의 두 가지 버그 수정 (thinking 제거, 주석 SQL 처리) |
+| `9c394c1` | merge: main 브랜치 병합 |
+| `2023dba` | data: MET KLIFS 데이터 수집 및 DB 복구 |
