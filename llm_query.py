@@ -112,8 +112,11 @@ def execute_sql(sql: str) -> tuple[list[dict], str | None]:
     Returns:
         (rows: list[dict], error: str | None)
     """
+    import re
     stripped = sql.strip()
-    upper = stripped.upper()
+    # 주석 제거 후 첫 키워드 검사 (Claude가 -- 주석을 SQL 앞에 붙이는 경우 대응)
+    cleaned = re.sub(r"--[^\n]*|/\*.*?\*/", "", stripped, flags=re.DOTALL).strip()
+    upper = cleaned.upper()
     if not (upper.startswith("SELECT") or upper.startswith("WITH")):
         return [], "보안 정책: SELECT 또는 WITH 쿼리만 허용됩니다."
     try:
@@ -169,8 +172,7 @@ def query_db_with_llm(
     for _ in range(MAX_ITERATIONS):
         response = client.messages.create(
             model="claude-opus-4-6",
-            max_tokens=4096,
-            thinking={"type": "adaptive"},
+            max_tokens=8192,
             system=_SYSTEM_PROMPT,
             tools=_TOOLS,
             messages=messages,
@@ -218,6 +220,14 @@ def query_db_with_llm(
         # pause_turn: 서버 루프 한도 도달 → 재전송
         if response.stop_reason == "pause_turn":
             continue
+
+        # max_tokens: 토큰 한도 도달 → 부분 응답에서 텍스트 추출 후 반환
+        if response.stop_reason == "max_tokens":
+            answer = next(
+                (b.text for b in response.content if b.type == "text"),
+                "응답이 너무 길어 잘렸습니다. 질문을 더 구체적으로 입력해주세요.",
+            )
+            return {"queries": executed_queries, "answer": answer, "error": None}
 
         # 예상치 못한 종료
         break
