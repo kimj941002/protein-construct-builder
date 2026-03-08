@@ -3,10 +3,11 @@
 # API URL, 데이터베이스 경로, 캐시 설정 등을 여기서 관리합니다.
 
 import os
-from dotenv import load_dotenv
-
-# .env 파일에서 환경변수 로드 (ANTHROPIC_API_KEY 등)
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # Streamlit Cloud 등 dotenv 없는 환경에서는 os.environ / st.secrets 사용
 
 # ─────────────────────────────────────────────
 # 데이터베이스 설정
