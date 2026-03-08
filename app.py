@@ -28,7 +28,7 @@ from database import (
     migrate_database,
     upsert_paper_analysis,
 )
-from chat_store import delete_chat, get_chat, load_history, save_chat
+from chat_store import delete_chat, extract_related_proteins, get_chat, load_history, save_chat
 from klifs_fetcher import fetch_klifs_for_structures
 from llm_query import query_db_with_llm
 from mutation_analyzer import analyze_mutations
@@ -352,9 +352,16 @@ with st.sidebar:
                     except Exception as _e:
                         _result = {"queries": [], "answer": "", "error": str(_e)}
 
+                # 질문·답변 텍스트에서 관련 단백질 자동 추출
+                _all_proteins = get_all_proteins()
+                _related_ids = extract_related_proteins(ai_q, _result, _all_proteins)
+                # 매칭된 단백질이 없으면 현재 선택 단백질로 폴백
+                if not _related_ids:
+                    _cur = st.session_state.get("uniprot_id", "")
+                    if _cur:
+                        _related_ids = [_cur]
                 # 파일에 저장 후 해당 기록을 선택 상태로 전환
-                _uid = st.session_state.get("uniprot_id", "")
-                _saved = save_chat(_uid, ai_q, _result)
+                _saved = save_chat(_related_ids, ai_q, _result)
                 st.session_state["ai_selected_chat_id"] = _saved["id"]
                 st.rerun()
         else:
