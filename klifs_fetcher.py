@@ -6,6 +6,7 @@
 # API 문서: https://klifs.net/swagger/
 # 엔드포인트: GET https://klifs.net/api/structures/pdb_complexes?pdb-codes={pdb_id}
 
+from __future__ import annotations
 import requests
 from database import insert_klifs_structure, get_klifs_by_structure
 

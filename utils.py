@@ -2,6 +2,7 @@
 # API 호출 유틸리티 함수 모음
 # 네트워크 오류, 속도 제한, 타임아웃 등 모든 케이스를 처리합니다.
 
+from __future__ import annotations
 import time
 import requests
 from requests.exceptions import ConnectionError, Timeout

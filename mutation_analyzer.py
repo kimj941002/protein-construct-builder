@@ -3,6 +3,7 @@
 # SIFTS API로 PDB ↔ UniProt 잔기 번호를 매핑하고,
 # WT(UniProt) 서열과 PDB 서열을 비교하여 차이를 찾습니다.
 
+from __future__ import annotations
 import json
 import os
 import requests

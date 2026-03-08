@@ -2,6 +2,7 @@
 # Protein Construct Builder — Streamlit + Ag-Grid UI (schema v2)
 # 실행: python -m streamlit run app.py
 
+from __future__ import annotations
 import base64
 import io
 import os

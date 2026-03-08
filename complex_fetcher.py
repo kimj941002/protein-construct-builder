@@ -8,6 +8,7 @@
 #   - fetch_oligosaccharides_for_structure(): Branched entity (올리고당) 수집 추가
 #   - process_complex(): 올리고당 처리 포함
 
+from __future__ import annotations
 import requests
 import json
 from config import (

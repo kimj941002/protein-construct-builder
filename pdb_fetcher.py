@@ -4,6 +4,7 @@
 # Polymer Entity API → 발현 시스템/서열/mutation
 # ThreadPoolExecutor로 병렬 처리
 
+from __future__ import annotations
 import json
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from config import (

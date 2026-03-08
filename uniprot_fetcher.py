@@ -2,6 +2,7 @@
 # UniProt API를 이용해 단백질 기본 정보를 수집하는 모듈
 # 검색어 정규화, API 호출, 결과 처리, DB 저장까지 담당합니다.
 
+from __future__ import annotations
 import json
 import os
 import requests
