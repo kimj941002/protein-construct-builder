@@ -576,6 +576,47 @@ with col_csv:
         use_container_width=True,
     )
 
+# ═════════════════════════════════════════════
+# AI 질의 결과 상세 패널
+# 반드시 st.stop() 이전에 위치해야 항상 렌더링됩니다.
+# ═════════════════════════════════════════════
+if "ai_query_result" in st.session_state:
+    _ai_r = st.session_state["ai_query_result"]
+    _ai_q = st.session_state.get("ai_query_question", "")
+
+    with st.expander("🤖 AI 질의 결과", expanded=True):
+        if _ai_q:
+            st.markdown(f"**질문:** {_ai_q}")
+            st.divider()
+
+        if _ai_r.get("error") and not _ai_r.get("queries"):
+            st.error(f"오류 발생: {_ai_r['error']}")
+        else:
+            _queries = _ai_r.get("queries", [])
+            if _queries:
+                with st.expander(f"실행된 SQL 쿼리 ({len(_queries)}개)", expanded=False):
+                    for _i, _q in enumerate(_queries, 1):
+                        st.markdown(f"**쿼리 {_i}**")
+                        st.code(_q["sql"], language="sql")
+                        if _q.get("error"):
+                            st.error(f"오류: {_q['error']}")
+                        elif _q.get("rows") is not None:
+                            _rows = _q["rows"]
+                            if _rows:
+                                st.dataframe(
+                                    pd.DataFrame(_rows).reset_index(drop=True),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                            else:
+                                st.caption("결과 없음 (0 rows)")
+
+            if _ai_r.get("answer"):
+                st.markdown("### 답변")
+                st.markdown(_ai_r["answer"])
+            elif _ai_r.get("error"):
+                st.warning(f"부분 실행 후 오류: {_ai_r['error']}")
+
 # ── 상세 패널 (행 선택 시) ───────────────────
 selected_rows = grid_response.get("selected_rows")
 if selected_rows is None or (hasattr(selected_rows, "__len__") and len(selected_rows) == 0):
@@ -924,46 +965,3 @@ with st.expander("📄 논문 PDF 분석", expanded=(status == "completed")):
     if status == "completed" and pa:
         st.markdown(pa.get("raw_text") or "")
         st.caption(f"분석일시: {pa.get('analyzed_at', '')[:19]}")
-
-# ═════════════════════════════════════════════
-# AI 질의 결과 상세 패널
-# ═════════════════════════════════════════════
-if "ai_query_result" in st.session_state:
-    _ai_r = st.session_state["ai_query_result"]
-    _ai_q = st.session_state.get("ai_query_question", "")
-
-    with st.expander("AI 질의 결과", expanded=True):
-        if _ai_q:
-            st.markdown(f"**질문:** {_ai_q}")
-            st.divider()
-
-        # 오류 처리
-        if _ai_r.get("error") and not _ai_r.get("queries"):
-            st.error(f"오류 발생: {_ai_r['error']}")
-        else:
-            # 실행된 SQL 쿼리 표시
-            _queries = _ai_r.get("queries", [])
-            if _queries:
-                with st.expander(f"실행된 SQL 쿼리 ({len(_queries)}개)", expanded=False):
-                    for _i, _q in enumerate(_queries, 1):
-                        st.markdown(f"**쿼리 {_i}**")
-                        st.code(_q["sql"], language="sql")
-                        if _q.get("error"):
-                            st.error(f"오류: {_q['error']}")
-                        elif _q.get("rows") is not None:
-                            _rows = _q["rows"]
-                            if _rows:
-                                st.dataframe(
-                                    pd.DataFrame(_rows).reset_index(drop=True),
-                                    use_container_width=True,
-                                    hide_index=True,
-                                )
-                            else:
-                                st.caption("결과 없음 (0 rows)")
-
-            # 최종 답변
-            if _ai_r.get("answer"):
-                st.markdown("### 답변")
-                st.markdown(_ai_r["answer"])
-            elif _ai_r.get("error"):
-                st.warning(f"부분 실행 후 오류: {_ai_r['error']}")
