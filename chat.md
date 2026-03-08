@@ -267,6 +267,62 @@ biopython 설치 실패
 
 ---
 
+---
+
+## 10. 채팅 기록 문서화 (chat.md 생성)
+
+**User:**
+우리 채팅내용 모두를 chat.md 라는 파일에 기록해서 프로젝트 폴더에 저장해줘.
+
+**Claude:**
+세션 전체 대화(항목 1~9)를 `chat.md`로 정리하여 프로젝트 루트에 저장. 커밋 히스토리 요약 테이블 포함.
+
+커밋: `b499a40` — GitHub push 완료
+
+---
+
+## 11. 채팅 기록 삭제 및 Tag 관리 기능
+
+**User:**
+그리고 llm 질의응답 채팅 기록을 삭제할 수 있는 기능을 만들고 싶은데. 대화 기록에서 해당 질문 칸 제일 오른쪽에 ...을 만들고 그걸 클릭하면 삭제 항목과 Tag를 만들어서 삭제 누르면 기록이 지워지고 tag를 누르면 현재 검색된 단백질 중에서 어느 단백질을 tag 걸건지 검색하고 다중 선택 할 수 있는 창을 만들었으면 좋겠어.
+
+**Claude:**
+**`chat_store.py`** — `update_chat_tags(chat_id, related_uniprot_ids)` 신규 추가.
+
+**`app.py`** 사이드바 채팅 리스트 재설계:
+
+```
+[ 질문 앞 24자 (버튼)          ] [ ··· ]
+```
+
+**`···` 클릭 시 `st.popover`:**
+- `🗑 삭제` → 기록 삭제 + 선택 패널 초기화 + rerun
+- `🏷 Tag` → Tag 편집 패널 열기 (`tagging_chat_id` 세션 세팅)
+
+**Tag 편집 패널** (리스트 하단):
+- DB 전체 단백질을 `st.multiselect`(검색 내장)로 표시
+- 현재 태그된 단백질 기본 선택 상태로 열림
+- 저장: `update_chat_tags()` 호출 → `related_uniprot_ids` 업데이트
+- 취소: 패널 닫힘
+
+검증: syntax OK, `streamlit run` HTTP 200 확인.
+
+커밋: `ce17676` — GitHub push 완료
+
+---
+
+## 12. chat.md 누락 내용 누적
+
+**User:**
+@chat.md 에 기록 안된 채팅 내용 누적해줘.
+
+**Claude:**
+항목 10(chat.md 생성), 11(삭제·Tag 기능), 12(이번 누적)를 chat.md에 추가. 커밋 히스토리 테이블 갱신.
+
+커밋: (현재) — GitHub push 완료
+
+---
+
 ## 커밋 히스토리 요약
 
 | 커밋 | 내용 |
@@ -281,3 +337,5 @@ biopython 설치 실패
 | `121d40f` | fix: Streamlit Cloud Python 3.9 호환성 오류 수정 (runtime.txt) |
 | `a0ed1bc` | fix: Python 3.9 호환성 — 전체 .py 파일 from __future__ 추가 |
 | `96d8bc3` | fix: Streamlit Cloud 배포 실패 원인 제거 (biopython, dotenv) |
+| `b499a40` | docs: 2026-03-08 개발 채팅 기록 저장 (chat.md) |
+| `ce17676` | feat: 채팅 기록 삭제 및 Tag 관리 기능 추가 |
