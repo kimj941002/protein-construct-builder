@@ -1,5 +1,6 @@
 # llm_query.py
 # Claude API tool use를 통해 단백질 DB에 자연어로 질의하는 모듈.
+from __future__ import annotations
 # Claude가 run_sql 도구로 필요한 쿼리를 직접 작성·실행하고,
 # 결과를 바탕으로 구조생물학적 맥락에서 답변을 생성합니다.
 

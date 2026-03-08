@@ -1,5 +1,6 @@
 # database.py
 # 정규화된 8-테이블 SQLite 스키마 및 CRUD 함수
+from __future__ import annotations
 # 스키마 버전 2 (2026-03-01)
 #
 # 테이블 구조:

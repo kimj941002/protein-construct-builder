@@ -7,6 +7,8 @@
 #   - 사이드바에서는 현재 선택된 단백질이 related_uniprot_ids 에 포함된 기록만 표시합니다.
 #   - 구버전 기록(단일 uniprot_id 필드)도 하위 호환됩니다.
 
+from __future__ import annotations
+
 import json
 import re
 import uuid
