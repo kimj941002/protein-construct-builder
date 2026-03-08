@@ -303,6 +303,67 @@ doi = citations[0].get('pdbx_database_id_doi', '해당없음') if citations else
 
 ---
 
+## ERROR-011: MET KLIFS 데이터 유실 (DB 미커밋 + migration INSERT OR IGNORE 취약점)
+
+**발생 파일:** `database.py` (migrate_database), `klifs_fetcher.py`
+**발생 일시:** 2026-03-08
+**영향 범위:** klifs_structures 테이블의 수집된 KLIFS 데이터
+
+### 증상
+MET의 klifs_structures 데이터(dfg, ac_helix 값)가 앱 재실행 후 사라짐.
+`klifs_structures` 전체 행이 초기 커밋(v2.2) 상태와 완전히 동일해짐.
+
+### 진단 결과
+```python
+# 초기 커밋 DB와 현재 DB의 klifs_structures 비교:
+initial_klifs == current_klifs  # True — 완전히 동일
+# 초기 커밋 MET pdb_structures 수 vs 현재: 129 == 129 — 동일
+# UNIQUE index 존재 여부: 없음 (migration 미실행 또는 DB 리셋)
+```
+
+### 원인 1 (주요): git-미커밋 로컬 DB 유실
+- MET KLIFS 데이터는 로컬에서 수집했으나 `protein_data.db`를 git에 push하지 않은 상태였음
+- 이전 세션에서 `git pull` 또는 코드 관련 git 작업 중 로컬 DB가 git 추적 버전으로 덮어씌워짐
+- **증거**: `git show 4a03505:protein_data.db`의 klifs_structures와 현재 DB가 100% 동일
+- 수집된 MET 구조 수(129개)도 동일 → 구조 데이터 이후 KLIFS만 미커밋 상태였음
+
+### 원인 2 (코드 취약점): migration의 INSERT OR IGNORE 순서 보장 없음
+```python
+# 기존 코드 (취약)
+cursor.execute("""
+    INSERT OR IGNORE INTO klifs_structures_new
+    SELECT * FROM klifs_structures        -- 행 순서 미보장
+""")
+```
+- sentinel 행(dfg=NULL)이 실제 데이터 행(dfg='DFGin')보다 먼저 삽입된 경우,
+  UNIQUE 제약 추가 migration 시 sentinel이 보존되고 실제 데이터는 IGNORE됨
+- SQLite SELECT * 는 rowid 순서로 반환되므로 먼저 삽입된 행이 우선됨
+
+### 해결 방법
+
+**즉각 복구**: sentinel rows가 없으므로 MET 재검색 시 자동 재수집 가능
+
+**코드 수정 (migration ORDER BY 추가)**:
+```python
+# 수정 후: dfg NOT NULL 행을 먼저 삽입하여 sentinel보다 실제 데이터 우선 보존
+cursor.execute("""
+    INSERT OR IGNORE INTO klifs_structures_new
+    SELECT * FROM klifs_structures
+    ORDER BY structure_id, (dfg IS NULL) ASC, id ASC
+""")
+# (dfg IS NULL) ASC: false(0, 데이터 있음)가 true(1, NULL sentinel)보다 먼저
+```
+
+### 예방 규칙
+> **DB 변경(마이그레이션 포함)이 포함된 코드 변경 전, 반드시 `protein_data.db`를 git add/commit/push 해야 한다.**
+> DB는 코드보다 훨씬 복구하기 어렵다. 코드와 DB의 git push 주기를 분리하되,
+> DB를 수정하는 코드 배포 전에는 반드시 DB snapshot을 먼저 push한다.
+>
+> 또한 migration에서 데이터를 복사할 때, 실제 값이 있는 행이 sentinel(NULL) 행보다
+> 먼저 삽입되도록 `ORDER BY (nullable_col IS NULL) ASC` 를 추가한다.
+
+---
+
 ## ERROR-010: st.dataframe 행 선택 인덱스 불일치
 
 **발생 파일:** `app.py`

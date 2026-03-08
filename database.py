@@ -345,9 +345,12 @@ def migrate_database():
                     FOREIGN KEY (structure_id) REFERENCES pdb_structures(structure_id)
                 )
             """)
+            # dfg NOT NULL 행(실제 데이터)을 sentinel(NULL) 행보다 먼저 삽입하여
+            # UNIQUE 충돌 시 실제 데이터가 보존되도록 ORDER BY 적용 (ERROR-011 참조)
             cursor.execute("""
                 INSERT OR IGNORE INTO klifs_structures_new
                 SELECT * FROM klifs_structures
+                ORDER BY structure_id, (dfg IS NULL) ASC, id ASC
             """)
             cursor.execute("DROP TABLE klifs_structures")
             cursor.execute("ALTER TABLE klifs_structures_new RENAME TO klifs_structures")
