@@ -158,7 +158,7 @@ def init_database():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS klifs_structures (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            structure_id     TEXT NOT NULL,
+            structure_id     TEXT NOT NULL UNIQUE,
             klifs_id         INTEGER,
             kinase_id        INTEGER,
             kinase_name      TEXT,
@@ -260,7 +260,7 @@ def migrate_database():
     cursor.execute("""
         CREATE TABLE IF NOT EXISTS klifs_structures (
             id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            structure_id     TEXT NOT NULL,
+            structure_id     TEXT NOT NULL UNIQUE,
             klifs_id         INTEGER,
             kinase_id        INTEGER,
             kinase_name      TEXT,
@@ -320,6 +320,38 @@ def migrate_database():
             if col not in pp_cols:
                 cursor.execute(f"ALTER TABLE partner_proteins ADD COLUMN {col} {coltype}")
                 print(f"[OK] partner_proteins 컬럼 추가: {col}")
+
+    # ── klifs_structures: UNIQUE(structure_id) 제약 추가 ─────
+    if "klifs_structures" in existing_tables:
+        klifs_indices = cursor.execute("PRAGMA index_list(klifs_structures)").fetchall()
+        klifs_has_unique = any(row[2] == 1 for row in klifs_indices)
+        if not klifs_has_unique:
+            cursor.execute("""
+                CREATE TABLE klifs_structures_new (
+                    id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                    structure_id     TEXT NOT NULL UNIQUE,
+                    klifs_id         INTEGER,
+                    kinase_id        INTEGER,
+                    kinase_name      TEXT,
+                    family           TEXT,
+                    dfg              TEXT,
+                    ac_helix         TEXT,
+                    qualityscore     REAL,
+                    missing_residues INTEGER,
+                    missing_atoms    INTEGER,
+                    rmsd1            REAL,
+                    rmsd2            REAL,
+                    gatekeeper       TEXT,
+                    FOREIGN KEY (structure_id) REFERENCES pdb_structures(structure_id)
+                )
+            """)
+            cursor.execute("""
+                INSERT OR IGNORE INTO klifs_structures_new
+                SELECT * FROM klifs_structures
+            """)
+            cursor.execute("DROP TABLE klifs_structures")
+            cursor.execute("ALTER TABLE klifs_structures_new RENAME TO klifs_structures")
+            print("[OK] klifs_structures: UNIQUE(structure_id) 마이그레이션 완료")
 
     conn.commit()
     conn.close()
@@ -836,11 +868,15 @@ def insert_klifs_structure(data: dict):
     """
     data 키: structure_id, dfg, ac_helix
     DFG 형태와 αC Helix 형태만 저장합니다.
+    이미 존재하는 경우 NULL이 아닌 값만 덮어씁니다 (기존 데이터 보호).
     """
     conn = get_connection()
     conn.execute("""
         INSERT INTO klifs_structures (structure_id, dfg, ac_helix)
         VALUES (:structure_id, :dfg, :ac_helix)
+        ON CONFLICT(structure_id) DO UPDATE SET
+            dfg      = COALESCE(excluded.dfg,      klifs_structures.dfg),
+            ac_helix = COALESCE(excluded.ac_helix, klifs_structures.ac_helix)
     """, data)
     conn.commit()
     conn.close()

@@ -50,7 +50,8 @@ def process_klifs(pdb_id: str, target_chain: str | None = None) -> bool:
     structures = fetch_klifs_for_pdb(pdb_id)
 
     if not structures:
-        # 비키나아제 또는 KLIFS 미등록 → 정상 skip
+        # 비키나아제 또는 KLIFS 미등록 → sentinel 행 삽입하여 다음 실행 시 재검색 방지
+        insert_klifs_structure({"structure_id": pdb_id, "dfg": None, "ac_helix": None})
         return False
 
     # 타겟 체인과 일치하는 항목 우선 선택
