@@ -155,3 +155,13 @@ def delete_chat(chat_id: str) -> None:
     """ID로 특정 대화 기록을 삭제합니다."""
     records = [r for r in _load_raw() if r.get("id") != chat_id]
     _save_raw(records)
+
+
+def update_chat_tags(chat_id: str, related_uniprot_ids: list[str]) -> None:
+    """특정 채팅 기록의 related_uniprot_ids를 업데이트합니다."""
+    records = _load_raw()
+    for r in records:
+        if r.get("id") == chat_id:
+            r["related_uniprot_ids"] = related_uniprot_ids
+            break
+    _save_raw(records)

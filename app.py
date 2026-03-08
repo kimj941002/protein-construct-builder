@@ -29,7 +29,10 @@ from database import (
     migrate_database,
     upsert_paper_analysis,
 )
-from chat_store import delete_chat, extract_related_proteins, get_chat, load_history, save_chat
+from chat_store import (
+    delete_chat, extract_related_proteins, get_chat,
+    load_history, save_chat, update_chat_tags,
+)
 from klifs_fetcher import fetch_klifs_for_structures
 from llm_query import query_db_with_llm
 from mutation_analyzer import analyze_mutations
@@ -375,17 +378,82 @@ with st.sidebar:
         st.divider()
         st.caption(f"대화 기록 ({len(_history)}개)")
         _selected_id = st.session_state.get("ai_selected_chat_id")
+
         for _rec in _history:
-            _label = _rec["question"][:30] + ("…" if len(_rec["question"]) > 30 else "")
+            _label = _rec["question"][:24] + ("…" if len(_rec["question"]) > 24 else "")
             _is_sel = _selected_id == _rec["id"]
-            if st.button(
-                _label,
-                key=f"chat_hist_{_rec['id']}",
-                use_container_width=True,
-                type="primary" if _is_sel else "secondary",
-            ):
-                st.session_state["ai_selected_chat_id"] = _rec["id"]
-                st.rerun()
+            _col_q, _col_menu = st.columns([5, 1])
+
+            with _col_q:
+                if st.button(
+                    _label,
+                    key=f"chat_hist_{_rec['id']}",
+                    use_container_width=True,
+                    type="primary" if _is_sel else "secondary",
+                ):
+                    st.session_state["ai_selected_chat_id"] = _rec["id"]
+                    st.session_state.pop("tagging_chat_id", None)
+                    st.rerun()
+
+            with _col_menu:
+                with st.popover("···", use_container_width=True):
+                    if st.button(
+                        "🗑 삭제",
+                        key=f"del_{_rec['id']}",
+                        use_container_width=True,
+                    ):
+                        delete_chat(_rec["id"])
+                        if st.session_state.get("ai_selected_chat_id") == _rec["id"]:
+                            st.session_state.pop("ai_selected_chat_id", None)
+                        st.session_state.pop("tagging_chat_id", None)
+                        st.rerun()
+
+                    if st.button(
+                        "🏷 Tag",
+                        key=f"tag_btn_{_rec['id']}",
+                        use_container_width=True,
+                    ):
+                        st.session_state["tagging_chat_id"] = _rec["id"]
+                        st.rerun()
+
+    # ── Tag 편집 패널 ─────────────────────────
+    _tagging_id = st.session_state.get("tagging_chat_id")
+    if _tagging_id:
+        _tag_chat = get_chat(_tagging_id)
+        if _tag_chat:
+            st.divider()
+            _preview = _tag_chat["question"][:22] + ("…" if len(_tag_chat["question"]) > 22 else "")
+            st.caption(f"🏷 Tag 편집: {_preview}")
+
+            _all_ps = get_all_proteins()
+            _opt_map = {
+                f"{p['gene_name']}  ({p['uniprot_id']})": p["uniprot_id"]
+                for p in _all_ps
+            }
+            _cur_ids  = _tag_chat.get("related_uniprot_ids", [])
+            _cur_lbls = [k for k, v in _opt_map.items() if v in _cur_ids]
+
+            _selected_lbls = st.multiselect(
+                "단백질 선택",
+                options=list(_opt_map.keys()),
+                default=_cur_lbls,
+                key=f"tag_ms_{_tagging_id}",
+                label_visibility="collapsed",
+                placeholder="단백질 검색 또는 선택…",
+            )
+
+            _tc1, _tc2 = st.columns(2)
+            with _tc1:
+                if st.button("저장", key="tag_save", use_container_width=True, type="primary"):
+                    update_chat_tags(_tagging_id, [_opt_map[l] for l in _selected_lbls])
+                    st.session_state.pop("tagging_chat_id", None)
+                    st.rerun()
+            with _tc2:
+                if st.button("취소", key="tag_cancel", use_container_width=True):
+                    st.session_state.pop("tagging_chat_id", None)
+                    st.rerun()
+        else:
+            st.session_state.pop("tagging_chat_id", None)
 
 
 # ═════════════════════════════════════════════
