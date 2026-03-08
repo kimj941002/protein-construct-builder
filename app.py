@@ -29,6 +29,7 @@ from database import (
     upsert_paper_analysis,
 )
 from klifs_fetcher import fetch_klifs_for_structures
+from llm_query import query_db_with_llm
 from mutation_analyzer import analyze_mutations
 from pdb_fetcher import fetch_all_structures
 from uniprot_fetcher import fetch_protein, load_sequence_from_file, normalize_gene_name
@@ -309,6 +310,63 @@ with st.sidebar:
             st.rerun()
     else:
         st.info("아직 수집된 단백질이 없습니다.\n위에서 검색해주세요.")
+
+
+# ═════════════════════════════════════════════
+# 사이드바 — AI 질의응답
+# st.stop() 이전에 렌더링되므로 단백질 미선택 상태에서도 항상 표시됩니다.
+# ═════════════════════════════════════════════
+with st.sidebar:
+    st.divider()
+    st.subheader("AI 질의응답")
+    st.caption("DB 전체를 대상으로 자연어로 질문하세요.")
+
+    ai_q = st.text_area(
+        "질문 입력",
+        placeholder=(
+            "예: DFGin 구조 중 해상도 2Å 미만인 것들을 알려줘\n"
+            "예: EGFR과 복합체를 형성하는 파트너 단백질 목록"
+        ),
+        height=110,
+        label_visibility="collapsed",
+        key="ai_question_input",
+    )
+
+    ai_clicked = st.button("질의하기", key="ai_query_btn", use_container_width=True)
+
+    if ai_clicked:
+        if ai_q.strip():
+            try:
+                _api_key = st.secrets.get("ANTHROPIC_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+            except (AttributeError, FileNotFoundError):
+                _api_key = os.getenv("ANTHROPIC_API_KEY")
+
+            if not _api_key:
+                st.error("ANTHROPIC_API_KEY가 설정되지 않았습니다.")
+            else:
+                with st.spinner("AI가 DB를 분석 중입니다..."):
+                    try:
+                        _result = query_db_with_llm(ai_q, api_key=_api_key)
+                        st.session_state["ai_query_result"] = _result
+                        st.session_state["ai_query_question"] = ai_q
+                    except Exception as _e:
+                        st.session_state["ai_query_result"] = {
+                            "queries": [],
+                            "answer": "",
+                            "error": str(_e),
+                        }
+                        st.session_state["ai_query_question"] = ai_q
+        else:
+            st.warning("질문을 입력해주세요.")
+
+    # 사이드바에 간단한 상태 표시
+    if "ai_query_result" in st.session_state:
+        _r = st.session_state["ai_query_result"]
+        if _r.get("error") and not _r.get("queries"):
+            st.error(f"오류: {_r['error']}")
+        elif _r.get("answer"):
+            st.success(f"답변 준비됨 — SQL {len(_r.get('queries', []))}회 실행")
+            st.caption("아래 'AI 질의 결과' 패널에서 전체 내용을 확인하세요.")
 
 
 # ═════════════════════════════════════════════
@@ -866,3 +924,46 @@ with st.expander("📄 논문 PDF 분석", expanded=(status == "completed")):
     if status == "completed" and pa:
         st.markdown(pa.get("raw_text") or "")
         st.caption(f"분석일시: {pa.get('analyzed_at', '')[:19]}")
+
+# ═════════════════════════════════════════════
+# AI 질의 결과 상세 패널
+# ═════════════════════════════════════════════
+if "ai_query_result" in st.session_state:
+    _ai_r = st.session_state["ai_query_result"]
+    _ai_q = st.session_state.get("ai_query_question", "")
+
+    with st.expander("AI 질의 결과", expanded=True):
+        if _ai_q:
+            st.markdown(f"**질문:** {_ai_q}")
+            st.divider()
+
+        # 오류 처리
+        if _ai_r.get("error") and not _ai_r.get("queries"):
+            st.error(f"오류 발생: {_ai_r['error']}")
+        else:
+            # 실행된 SQL 쿼리 표시
+            _queries = _ai_r.get("queries", [])
+            if _queries:
+                with st.expander(f"실행된 SQL 쿼리 ({len(_queries)}개)", expanded=False):
+                    for _i, _q in enumerate(_queries, 1):
+                        st.markdown(f"**쿼리 {_i}**")
+                        st.code(_q["sql"], language="sql")
+                        if _q.get("error"):
+                            st.error(f"오류: {_q['error']}")
+                        elif _q.get("rows") is not None:
+                            _rows = _q["rows"]
+                            if _rows:
+                                st.dataframe(
+                                    pd.DataFrame(_rows).reset_index(drop=True),
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+                            else:
+                                st.caption("결과 없음 (0 rows)")
+
+            # 최종 답변
+            if _ai_r.get("answer"):
+                st.markdown("### 답변")
+                st.markdown(_ai_r["answer"])
+            elif _ai_r.get("error"):
+                st.warning(f"부분 실행 후 오류: {_ai_r['error']}")
