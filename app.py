@@ -28,6 +28,7 @@ from database import (
     migrate_database,
     upsert_paper_analysis,
 )
+from chat_store import delete_chat, get_chat, load_history, save_chat
 from klifs_fetcher import fetch_klifs_for_structures
 from llm_query import query_db_with_llm
 from mutation_analyzer import analyze_mutations
@@ -307,6 +308,7 @@ with st.sidebar:
         if selected_uid != current_uid:
             st.session_state["uniprot_id"]   = selected_uid
             st.session_state["protein_data"] = None
+            st.session_state.pop("ai_selected_chat_id", None)
             st.rerun()
     else:
         st.info("아직 수집된 단백질이 없습니다.\n위에서 검색해주세요.")
@@ -347,26 +349,35 @@ with st.sidebar:
                 with st.spinner("AI가 DB를 분석 중입니다..."):
                     try:
                         _result = query_db_with_llm(ai_q, api_key=_api_key)
-                        st.session_state["ai_query_result"] = _result
-                        st.session_state["ai_query_question"] = ai_q
                     except Exception as _e:
-                        st.session_state["ai_query_result"] = {
-                            "queries": [],
-                            "answer": "",
-                            "error": str(_e),
-                        }
-                        st.session_state["ai_query_question"] = ai_q
+                        _result = {"queries": [], "answer": "", "error": str(_e)}
+
+                # 파일에 저장 후 해당 기록을 선택 상태로 전환
+                _uid = st.session_state.get("uniprot_id", "")
+                _saved = save_chat(_uid, ai_q, _result)
+                st.session_state["ai_selected_chat_id"] = _saved["id"]
+                st.rerun()
         else:
             st.warning("질문을 입력해주세요.")
 
-    # 사이드바에 간단한 상태 표시
-    if "ai_query_result" in st.session_state:
-        _r = st.session_state["ai_query_result"]
-        if _r.get("error") and not _r.get("queries"):
-            st.error(f"오류: {_r['error']}")
-        elif _r.get("answer"):
-            st.success(f"답변 준비됨 — SQL {len(_r.get('queries', []))}회 실행")
-            st.caption("아래 'AI 질의 결과' 패널에서 전체 내용을 확인하세요.")
+    # ── 대화 기록 리스트 ──────────────────────
+    _cur_uid = st.session_state.get("uniprot_id", "")
+    _history = load_history(uniprot_id=_cur_uid) if _cur_uid else []
+    if _history:
+        st.divider()
+        st.caption(f"대화 기록 ({len(_history)}개)")
+        _selected_id = st.session_state.get("ai_selected_chat_id")
+        for _rec in _history:
+            _label = _rec["question"][:30] + ("…" if len(_rec["question"]) > 30 else "")
+            _is_sel = _selected_id == _rec["id"]
+            if st.button(
+                _label,
+                key=f"chat_hist_{_rec['id']}",
+                use_container_width=True,
+                type="primary" if _is_sel else "secondary",
+            ):
+                st.session_state["ai_selected_chat_id"] = _rec["id"]
+                st.rerun()
 
 
 # ═════════════════════════════════════════════
@@ -483,6 +494,7 @@ if search_clicked and query.strip():
 
     st.session_state["uniprot_id"]   = protein_data["uniprot_id"]
     st.session_state["protein_data"] = protein_data
+    st.session_state.pop("ai_selected_chat_id", None)
     st.rerun()
 
 
@@ -578,44 +590,45 @@ with col_csv:
 
 # ═════════════════════════════════════════════
 # AI 질의 결과 상세 패널
-# 반드시 st.stop() 이전에 위치해야 항상 렌더링됩니다.
+# ai_selected_chat_id 가 설정된 경우에만 렌더링됩니다.
+# 단백질 전환·재검색 시 세션에서 이 키가 제거되어 패널이 사라집니다.
 # ═════════════════════════════════════════════
-if "ai_query_result" in st.session_state:
-    _ai_r = st.session_state["ai_query_result"]
-    _ai_q = st.session_state.get("ai_query_question", "")
-
-    with st.expander("🤖 AI 질의 결과", expanded=True):
-        if _ai_q:
-            st.markdown(f"**질문:** {_ai_q}")
+_selected_chat_id = st.session_state.get("ai_selected_chat_id")
+if _selected_chat_id:
+    _chat = get_chat(_selected_chat_id)
+    if _chat:
+        with st.expander("🤖 AI 질의 결과", expanded=True):
+            st.markdown(f"**질문:** {_chat['question']}")
+            st.caption(f"질의 시각: {_chat['timestamp'][:19].replace('T', ' ')}")
             st.divider()
 
-        if _ai_r.get("error") and not _ai_r.get("queries"):
-            st.error(f"오류 발생: {_ai_r['error']}")
-        else:
-            _queries = _ai_r.get("queries", [])
-            if _queries:
-                with st.expander(f"실행된 SQL 쿼리 ({len(_queries)}개)", expanded=False):
-                    for _i, _q in enumerate(_queries, 1):
-                        st.markdown(f"**쿼리 {_i}**")
-                        st.code(_q["sql"], language="sql")
-                        if _q.get("error"):
-                            st.error(f"오류: {_q['error']}")
-                        elif _q.get("rows") is not None:
-                            _rows = _q["rows"]
-                            if _rows:
-                                st.dataframe(
-                                    pd.DataFrame(_rows).reset_index(drop=True),
-                                    use_container_width=True,
-                                    hide_index=True,
-                                )
-                            else:
-                                st.caption("결과 없음 (0 rows)")
+            if _chat.get("error") and not _chat.get("queries"):
+                st.error(f"오류 발생: {_chat['error']}")
+            else:
+                _queries = _chat.get("queries", [])
+                if _queries:
+                    with st.expander(f"실행된 SQL 쿼리 ({len(_queries)}개)", expanded=False):
+                        for _i, _q in enumerate(_queries, 1):
+                            st.markdown(f"**쿼리 {_i}**")
+                            st.code(_q["sql"], language="sql")
+                            if _q.get("error"):
+                                st.error(f"오류: {_q['error']}")
+                            elif _q.get("rows") is not None:
+                                _rows = _q["rows"]
+                                if _rows:
+                                    st.dataframe(
+                                        pd.DataFrame(_rows).reset_index(drop=True),
+                                        use_container_width=True,
+                                        hide_index=True,
+                                    )
+                                else:
+                                    st.caption("결과 없음 (0 rows)")
 
-            if _ai_r.get("answer"):
-                st.markdown("### 답변")
-                st.markdown(_ai_r["answer"])
-            elif _ai_r.get("error"):
-                st.warning(f"부분 실행 후 오류: {_ai_r['error']}")
+                if _chat.get("answer"):
+                    st.markdown("### 답변")
+                    st.markdown(_chat["answer"])
+                elif _chat.get("error"):
+                    st.warning(f"부분 실행 후 오류: {_chat['error']}")
 
 # ── 상세 패널 (행 선택 시) ───────────────────
 selected_rows = grid_response.get("selected_rows")
