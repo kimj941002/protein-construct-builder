@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 import sqlite3
 
 import anthropic
@@ -170,13 +171,25 @@ def query_db_with_llm(
     MAX_ITERATIONS = 20
 
     for _ in range(MAX_ITERATIONS):
-        response = client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=20000,
-            system=_SYSTEM_PROMPT,
-            tools=_TOOLS,
-            messages=messages,
-        )
+        for attempt in range(3):
+            try:
+                response = client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=16384,
+                    system=_SYSTEM_PROMPT,
+                    tools=_TOOLS,
+                    messages=messages,
+                )
+                break
+            except anthropic.RateLimitError:
+                if attempt < 2:
+                    time.sleep(30)
+                else:
+                    return {
+                        "queries": executed_queries,
+                        "answer": "",
+                        "error": "API 호출 한도 초과. 30초 후 다시 시도해주세요.",
+                    }
 
         # 어시스턴트 응답 메시지 히스토리에 추가
         messages.append({"role": "assistant", "content": response.content})
