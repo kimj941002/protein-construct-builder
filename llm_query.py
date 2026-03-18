@@ -167,12 +167,12 @@ def query_db_with_llm(
     client = anthropic.Anthropic(api_key=api_key)
     messages: list[dict] = [{"role": "user", "content": question}]
     executed_queries: list[dict] = []
-    MAX_ITERATIONS = 10
+    MAX_ITERATIONS = 20
 
     for _ in range(MAX_ITERATIONS):
         response = client.messages.create(
             model="claude-opus-4-6",
-            max_tokens=8192,
+            max_tokens=20000,
             system=_SYSTEM_PROMPT,
             tools=_TOOLS,
             messages=messages,
