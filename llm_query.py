@@ -171,7 +171,7 @@ def query_db_with_llm(
 
     for _ in range(MAX_ITERATIONS):
         response = client.messages.create(
-            model="claude-opus-4-6",
+            model="claude-sonnet-4-20250514",
             max_tokens=20000,
             system=_SYSTEM_PROMPT,
             tools=_TOOLS,
