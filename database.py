@@ -558,6 +558,42 @@ def delete_protein(uniprot_id: str):
 
 
 # ═══════════════════════════════════════════
+# app_state — 앱 상태 영구 저장 (마지막 선택 단백질 등)
+# ═══════════════════════════════════════════
+
+def save_last_selected_protein(uniprot_id: str):
+    """마지막으로 선택/검색한 단백질 ID를 DB에 저장합니다."""
+    conn = get_connection()
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS app_state (
+            key   TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    conn.execute(
+        "INSERT OR REPLACE INTO app_state (key, value) VALUES (?, ?)",
+        ("last_selected_protein", uniprot_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def load_last_selected_protein() -> str | None:
+    """마지막으로 선택/검색한 단백질 ID를 DB에서 읽어옵니다."""
+    conn = get_connection()
+    try:
+        row = conn.execute(
+            "SELECT value FROM app_state WHERE key = ?",
+            ("last_selected_protein",),
+        ).fetchone()
+        return row["value"] if row else None
+    except Exception:
+        return None
+    finally:
+        conn.close()
+
+
+# ═══════════════════════════════════════════
 # 2. protein_domains CRUD
 # ═══════════════════════════════════════════
 

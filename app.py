@@ -26,7 +26,9 @@ from database import (
     get_partners_by_structure,
     get_protein,
     get_structures_by_uniprot,
+    load_last_selected_protein,
     migrate_database,
+    save_last_selected_protein,
     upsert_paper_analysis,
 )
 from chat_store import (
@@ -44,6 +46,15 @@ from utils import api_call_with_retry, create_cached_session
 # 앱 시작 시 DB 마이그레이션
 # ─────────────────────────────────────────────
 migrate_database()
+
+# ─────────────────────────────────────────────
+# 세션 복원: 마지막으로 선택한 단백질 자동 로드
+# ─────────────────────────────────────────────
+if "uniprot_id" not in st.session_state:
+    _last_uid = load_last_selected_protein()
+    if _last_uid and get_protein(_last_uid):
+        st.session_state["uniprot_id"] = _last_uid
+        st.session_state["protein_data"] = None
 
 # ─────────────────────────────────────────────
 # 페이지 설정
@@ -313,6 +324,7 @@ with st.sidebar:
             st.session_state["uniprot_id"]   = selected_uid
             st.session_state["protein_data"] = None
             st.session_state.pop("ai_selected_chat_id", None)
+            save_last_selected_protein(selected_uid)
             st.rerun()
     else:
         st.info("아직 수집된 단백질이 없습니다.\n위에서 검색해주세요.")
@@ -571,6 +583,7 @@ if search_clicked and query.strip():
     st.session_state["uniprot_id"]   = protein_data["uniprot_id"]
     st.session_state["protein_data"] = protein_data
     st.session_state.pop("ai_selected_chat_id", None)
+    save_last_selected_protein(protein_data["uniprot_id"])
     st.rerun()
 
 
