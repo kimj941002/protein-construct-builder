@@ -6,6 +6,7 @@ from __future__ import annotations
 import base64
 import io
 import os
+import subprocess
 from datetime import datetime
 
 import anthropic
@@ -46,6 +47,37 @@ from utils import api_call_with_retry, create_cached_session
 # 앱 시작 시 DB 마이그레이션
 # ─────────────────────────────────────────────
 migrate_database()
+
+
+# ─────────────────────────────────────────────
+# DB 자동 GitHub 저장
+# ─────────────────────────────────────────────
+def _git_push_db(gene_name: str) -> None:
+    """protein_data.db와 sequences/ 변경분을 git commit & push합니다."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    try:
+        subprocess.run(
+            ["git", "add", "protein_data.db", "sequences/"],
+            cwd=base, check=True, capture_output=True,
+        )
+        result = subprocess.run(
+            ["git", "diff", "--cached", "--quiet"],
+            cwd=base, capture_output=True,
+        )
+        if result.returncode == 0:
+            return  # 변경 없으면 커밋 생략
+        subprocess.run(
+            ["git", "commit", "-m", f"data: {gene_name} 데이터 수집 자동 저장"],
+            cwd=base, check=True, capture_output=True,
+        )
+        subprocess.run(
+            ["git", "push"],
+            cwd=base, check=True, capture_output=True,
+        )
+        print(f"[OK] GitHub 자동 저장 완료: {gene_name}")
+    except subprocess.CalledProcessError as e:
+        print(f"[WARN] GitHub 자동 저장 실패: {e.stderr.decode(errors='replace')}")
+
 
 # ─────────────────────────────────────────────
 # 세션 복원: 마지막으로 선택한 단백질 자동 로드
@@ -584,6 +616,8 @@ if search_clicked and query.strip():
     st.session_state["protein_data"] = protein_data
     st.session_state.pop("ai_selected_chat_id", None)
     save_last_selected_protein(protein_data["uniprot_id"])
+    with st.spinner("GitHub에 데이터 저장 중..."):
+        _git_push_db(protein_data["gene_name"])
     st.rerun()
 
 
