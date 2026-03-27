@@ -19,6 +19,7 @@ from config import PAPERS_DIR, RCSB_ENTRY_API
 from database import (
     get_all_proteins,
     get_all_chains_by_structure,
+    get_domains_by_uniprot,
     get_klifs_bulk,
     get_ligands_by_structure,
     get_mutations_by_structure,
@@ -131,6 +132,98 @@ def format_sequence(sequence: str, block_size: int = 10) -> str:
         blocks = [chunk[j:j + block_size] for j in range(0, len(chunk), block_size)]
         lines.append(f"{i + 1:>6}  {'  '.join(blocks)}")
     return "\n".join(lines)
+
+
+# ─────────────────────────────────────────────
+# 도메인 맵 렌더러
+# ─────────────────────────────────────────────
+_DOMAIN_COLORS = [
+    "#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3",
+    "#937860", "#DA8BC3", "#8C8C8C", "#CCB974", "#64B5CD",
+]
+
+def _render_domain_map(uniprot_id: str, seq_length: int) -> None:
+    """UniProt 도메인 정보를 수평 맵 + 표로 시각화합니다."""
+    domains = get_domains_by_uniprot(uniprot_id)
+    if not domains:
+        st.caption("등록된 도메인 정보가 없습니다.")
+        return
+
+    # ── 1. 수평 도메인 맵 (HTML) ─────────────────────────────
+    segments_html = ""
+    for i, d in enumerate(domains):
+        start = d.get("start_pos") or 0
+        end   = d.get("end_pos")   or seq_length
+        color = _DOMAIN_COLORS[i % len(_DOMAIN_COLORS)]
+        left  = start / seq_length * 100
+        width = max((end - start) / seq_length * 100, 1.0)
+        label = d["name"]
+        tooltip = f"{label} ({start}–{end})"
+        segments_html += (
+            f'<div title="{tooltip}" style="'
+            f'position:absolute;left:{left:.2f}%;width:{width:.2f}%;'
+            f'height:100%;background:{color};opacity:0.85;'
+            f'border-radius:3px;border:1px solid rgba(0,0,0,0.15);'
+            f'display:flex;align-items:center;justify-content:center;overflow:hidden;">'
+            f'<span style="font-size:10px;color:#fff;font-weight:600;'
+            f'white-space:nowrap;padding:0 3px;text-overflow:ellipsis;overflow:hidden;">'
+            f'{label}</span></div>'
+        )
+
+    tick_labels = ""
+    for pct in [0, 25, 50, 75, 100]:
+        pos = int(seq_length * pct / 100)
+        tick_labels += (
+            f'<span style="position:absolute;left:{pct}%;transform:translateX(-50%);'
+            f'font-size:10px;color:#888;">{pos}</span>'
+        )
+
+    map_html = f"""
+<div style="margin:8px 0 4px 0;">
+  <div style="position:relative;width:100%;height:28px;background:#e8ecf0;
+              border-radius:4px;overflow:visible;">
+    {segments_html}
+  </div>
+  <div style="position:relative;width:100%;height:18px;margin-top:2px;">
+    {tick_labels}
+  </div>
+  <div style="font-size:10px;color:#aaa;text-align:right;margin-top:0px;">
+    residue position (UniProt)
+  </div>
+</div>
+"""
+    st.markdown(map_html, unsafe_allow_html=True)
+
+    # ── 2. 도메인 표 ─────────────────────────────────────────
+    rows = []
+    for i, d in enumerate(domains):
+        start  = d.get("start_pos") or 0
+        end    = d.get("end_pos")   or seq_length
+        color  = _DOMAIN_COLORS[i % len(_DOMAIN_COLORS)]
+        swatch = (
+            f'<span style="display:inline-block;width:10px;height:10px;'
+            f'background:{color};border-radius:2px;margin-right:5px;"></span>'
+        )
+        rows.append({
+            "": swatch + d["name"],
+            "Start": start,
+            "End": end,
+            "Length (aa)": end - start + 1,
+        })
+
+    df = pd.DataFrame(rows)
+    st.markdown(
+        df.to_html(index=False, escape=False,
+                   classes="domain-table",
+                   border=0),
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "<style>.domain-table{font-size:13px;border-collapse:collapse;width:100%}"
+        ".domain-table th,.domain-table td{padding:4px 10px;border-bottom:1px solid #eee;}"
+        ".domain-table th{background:#f5f5f5;font-weight:600;}</style>",
+        unsafe_allow_html=True,
+    )
 
 
 # ─────────────────────────────────────────────
@@ -575,6 +668,9 @@ if search_clicked and query.strip():
         seq = load_sequence_from_file(protein_data.get("sequence_path", ""))
         st.code(format_sequence(seq), language=None)
 
+    with st.expander("도메인 맵 (UniProt)"):
+        _render_domain_map(protein_data["uniprot_id"], protein_data["sequence_length"])
+
     # Step 2: PDB 구조 수집 (증분 — 신규 항목만)
     st.markdown(f"### PDB 구조 수집 중... (UniProt 전체 {len(pdb_ids)}개)")
     progress_bar = st.progress(0)
@@ -682,6 +778,8 @@ if not search_clicked:
     with st.expander("아미노산 서열 보기"):
         seq = load_sequence_from_file(protein_data.get("sequence_path", ""))
         st.code(format_sequence(seq), language=None)
+    with st.expander("도메인 맵 (UniProt)", expanded=True):
+        _render_domain_map(protein_data["uniprot_id"], protein_data["sequence_length"])
 
 # ── 구조 목록 로드 ───────────────────────────
 structures = get_structures_by_uniprot(uniprot_id)
