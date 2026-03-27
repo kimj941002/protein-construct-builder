@@ -53,30 +53,57 @@ migrate_database()
 # DB 자동 GitHub 저장
 # ─────────────────────────────────────────────
 def _git_push_db(gene_name: str) -> None:
-    """protein_data.db와 sequences/ 변경분을 git commit & push합니다."""
+    """protein_data.db와 sequences/ 변경분을 origin/main에 commit & push합니다."""
     base = os.path.dirname(os.path.abspath(__file__))
     try:
+        # 1. 현재 브랜치 확인 — main이 아니면 main으로 전환
+        cur_branch = subprocess.run(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
+            cwd=base, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+        if cur_branch != "main":
+            subprocess.run(
+                ["git", "fetch", "origin", "main"],
+                cwd=base, check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "checkout", "main"],
+                cwd=base, check=True, capture_output=True,
+            )
+            subprocess.run(
+                ["git", "pull", "origin", "main"],
+                cwd=base, check=True, capture_output=True,
+            )
+
+        # 2. DB·시퀀스 파일 스테이징
         subprocess.run(
             ["git", "add", "protein_data.db", "sequences/"],
             cwd=base, check=True, capture_output=True,
         )
+
+        # 3. 변경 없으면 생략
         result = subprocess.run(
             ["git", "diff", "--cached", "--quiet"],
             cwd=base, capture_output=True,
         )
         if result.returncode == 0:
-            return  # 변경 없으면 커밋 생략
+            print(f"[INFO] 변경 없음, GitHub 저장 생략: {gene_name}")
+            return
+
+        # 4. origin/main에 commit & push
         subprocess.run(
             ["git", "commit", "-m", f"data: {gene_name} 데이터 수집 자동 저장"],
             cwd=base, check=True, capture_output=True,
         )
         subprocess.run(
-            ["git", "push"],
+            ["git", "push", "origin", "main"],
             cwd=base, check=True, capture_output=True,
         )
-        print(f"[OK] GitHub 자동 저장 완료: {gene_name}")
+        print(f"[OK] GitHub origin/main 자동 저장 완료: {gene_name}")
     except subprocess.CalledProcessError as e:
-        print(f"[WARN] GitHub 자동 저장 실패: {e.stderr.decode(errors='replace')}")
+        stderr = e.stderr.decode(errors="replace") if e.stderr else str(e)
+        print(f"[WARN] GitHub 자동 저장 실패: {stderr}")
 
 
 # ─────────────────────────────────────────────
