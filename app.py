@@ -52,58 +52,53 @@ migrate_database()
 # ─────────────────────────────────────────────
 # DB 자동 GitHub 저장
 # ─────────────────────────────────────────────
-def _git_push_db(gene_name: str) -> None:
-    """protein_data.db와 sequences/ 변경분을 origin/main에 commit & push합니다."""
+def _git_push_db(gene_name: str, label: str = "") -> bool:
+    """
+    protein_data.db와 sequences/ 변경분을 origin/main에 commit & push합니다.
+    반환값: True(성공) / False(변경없음 또는 실패)
+    """
     base = os.path.dirname(os.path.abspath(__file__))
     try:
-        # 1. 현재 브랜치 확인 — main이 아니면 main으로 전환
+        # 브랜치가 main이 아니면 main으로 전환
         cur_branch = subprocess.run(
             ["git", "rev-parse", "--abbrev-ref", "HEAD"],
             cwd=base, check=True, capture_output=True, text=True,
         ).stdout.strip()
 
         if cur_branch != "main":
-            subprocess.run(
-                ["git", "fetch", "origin", "main"],
-                cwd=base, check=True, capture_output=True,
-            )
-            subprocess.run(
-                ["git", "checkout", "main"],
-                cwd=base, check=True, capture_output=True,
-            )
-            subprocess.run(
-                ["git", "pull", "origin", "main"],
-                cwd=base, check=True, capture_output=True,
-            )
+            subprocess.run(["git", "fetch", "origin", "main"],
+                           cwd=base, check=True, capture_output=True)
+            subprocess.run(["git", "checkout", "main"],
+                           cwd=base, check=True, capture_output=True)
+            subprocess.run(["git", "pull", "origin", "main"],
+                           cwd=base, check=True, capture_output=True)
 
-        # 2. DB·시퀀스 파일 스테이징
-        subprocess.run(
-            ["git", "add", "protein_data.db", "sequences/"],
-            cwd=base, check=True, capture_output=True,
-        )
+        # DB·시퀀스 스테이징
+        subprocess.run(["git", "add", "protein_data.db", "sequences/"],
+                       cwd=base, check=True, capture_output=True)
 
-        # 3. 변경 없으면 생략
-        result = subprocess.run(
-            ["git", "diff", "--cached", "--quiet"],
-            cwd=base, capture_output=True,
-        )
-        if result.returncode == 0:
-            print(f"[INFO] 변경 없음, GitHub 저장 생략: {gene_name}")
-            return
+        # 변경 없으면 생략
+        diff = subprocess.run(["git", "diff", "--cached", "--quiet"],
+                              cwd=base, capture_output=True)
+        if diff.returncode == 0:
+            return False
 
-        # 4. origin/main에 commit & push
-        subprocess.run(
-            ["git", "commit", "-m", f"data: {gene_name} 데이터 수집 자동 저장"],
-            cwd=base, check=True, capture_output=True,
-        )
-        subprocess.run(
-            ["git", "push", "origin", "main"],
-            cwd=base, check=True, capture_output=True,
-        )
-        print(f"[OK] GitHub origin/main 자동 저장 완료: {gene_name}")
+        # commit 메시지 구성
+        msg = f"data: {gene_name} {label}자동 저장".strip()
+        subprocess.run(["git", "commit", "-m", msg],
+                       cwd=base, check=True, capture_output=True)
+        subprocess.run(["git", "push", "origin", "main"],
+                       cwd=base, check=True, capture_output=True)
+
+        print(f"[OK] GitHub origin/main 저장 완료: {msg}")
+        return True
+
     except subprocess.CalledProcessError as e:
-        stderr = e.stderr.decode(errors="replace") if e.stderr else str(e)
-        print(f"[WARN] GitHub 자동 저장 실패: {stderr}")
+        stderr = (e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes)
+                  else str(e.stderr or e))
+        print(f"[WARN] GitHub 저장 실패 ({gene_name}): {stderr}")
+        st.warning(f"⚠️ GitHub 저장 실패: {stderr[:200]}")
+        return False
 
 
 # ─────────────────────────────────────────────
@@ -571,6 +566,11 @@ if search_clicked and query.strip():
     c3.metric("Sequence Len", f"{protein_data['sequence_length']} aa")
     c4.metric("PDB 구조 수",  f"{len(pdb_ids)}개")
 
+    # ── 조기 저장: UniProt 수집 직후 즉시 GitHub push ──────────
+    # PDB 수집 도중 reboot 돼도 단백질 기본 정보는 보존됨
+    with st.spinner("단백질 정보 GitHub 저장 중..."):
+        _git_push_db(protein_data["gene_name"], label="기본정보 ")
+
     with st.expander("아미노산 서열 보기"):
         seq = load_sequence_from_file(protein_data.get("sequence_path", ""))
         st.code(format_sequence(seq), language=None)
@@ -643,8 +643,12 @@ if search_clicked and query.strip():
     st.session_state["protein_data"] = protein_data
     st.session_state.pop("ai_selected_chat_id", None)
     save_last_selected_protein(protein_data["uniprot_id"])
-    with st.spinner("GitHub에 데이터 저장 중..."):
-        _git_push_db(protein_data["gene_name"])
+
+    # ── 최종 저장: 전체 파이프라인 완료 후 GitHub push ──────────
+    with st.spinner("전체 데이터 GitHub 최종 저장 중..."):
+        pushed = _git_push_db(protein_data["gene_name"], label="전체 수집 완료 ")
+    if pushed:
+        st.success(f"✅ {protein_data['gene_name']} 데이터가 GitHub에 저장되었습니다.")
     st.rerun()
 
 
