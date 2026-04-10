@@ -1,5 +1,6 @@
 # database.py
 # 정규화된 8-테이블 SQLite 스키마 및 CRUD 함수
+# Turso (libSQL) 원격 DB 지원: 환경변수 미설정 시 로컬 SQLite 폴백
 from __future__ import annotations
 # 스키마 버전 2 (2026-03-01)
 #
@@ -13,16 +14,39 @@ from __future__ import annotations
 #   7. partner_protein_chains— 파트너 체인 목록 (partner_proteins.partner_chains JSON 분리)
 #   8. ptm_oligosaccharides  — 올리고당류 / PTM
 
-import sqlite3
 import json
 import os
-from config import DB_PATH, SEQUENCES_DIR
+
+from config import DB_PATH, SEQUENCES_DIR, TURSO_DATABASE_URL, TURSO_AUTH_TOKEN
+
+# Turso(libSQL) 사용 가능 여부 — 없으면 sqlite3 폴백
+try:
+    import libsql_experimental as libsql
+    _USE_LIBSQL = True
+except ImportError:
+    import sqlite3 as libsql          # 폴백: 표준 sqlite3
+    _USE_LIBSQL = False
+
+_TURSO_ENABLED = bool(_USE_LIBSQL and TURSO_DATABASE_URL and TURSO_AUTH_TOKEN)
 
 
 def get_connection():
-    """데이터베이스 연결을 반환합니다."""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    """
+    데이터베이스 연결을 반환합니다.
+    - Turso 설정이 있으면: 로컬 DB + 원격 Turso 동기화 (embedded replica)
+    - 없으면: 로컬 SQLite 파일 직접 사용
+    """
+    if _TURSO_ENABLED:
+        conn = libsql.connect(
+            DB_PATH,
+            sync_url=TURSO_DATABASE_URL,
+            auth_token=TURSO_AUTH_TOKEN,
+        )
+        conn.sync()
+    else:
+        conn = libsql.connect(DB_PATH)
+
+    conn.row_factory = libsql.Row
     return conn
 
 

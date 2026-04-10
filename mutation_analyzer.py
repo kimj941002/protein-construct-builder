@@ -370,8 +370,8 @@ if __name__ == "__main__":
     analyze_all_structures(TARGET_UNIPROT, session)
 
     # DB 결과 확인
-    import sqlite3
-    conn = sqlite3.connect("protein_data.db")
+    from database import get_connection
+    conn = get_connection()
     cursor = conn.cursor()
     print()
     print("[DB 결과]")

@@ -6,12 +6,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import time
-import sqlite3
 
 import anthropic
 
-from config import DB_PATH
+from database import get_connection
 
 # ─────────────────────────────────────────────
 # DB 스키마 설명 (시스템 프롬프트용)
@@ -121,8 +121,7 @@ def execute_sql(sql: str) -> tuple[list[dict], str | None]:
     if not (upper.startswith("SELECT") or upper.startswith("WITH")):
         return [], "보안 정책: SELECT 또는 WITH 쿼리만 허용됩니다."
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
+        conn = get_connection()
         rows = [dict(r) for r in conn.execute(stripped).fetchall()]
         conn.close()
         return rows, None

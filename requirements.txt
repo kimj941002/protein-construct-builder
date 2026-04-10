@@ -6,4 +6,5 @@ pandas>=1.3.0
 openpyxl>=3.0.0
 anthropic>=0.40.0
 python-dotenv>=1.0.0
+libsql-experimental>=0.0.34
 pypdf>=4.0.0

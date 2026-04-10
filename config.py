@@ -13,7 +13,14 @@ except ImportError:
 # 데이터베이스 설정
 # ─────────────────────────────────────────────
 
-# protein_data.db: 수집한 단백질/구조 데이터를 저장하는 SQLite 파일
+# Turso (libSQL) 원격 DB 설정
+# 환경변수 또는 .env 파일에서 읽어옵니다.
+# 예: TURSO_DATABASE_URL=libsql://mydb-myorg.turso.io
+#     TURSO_AUTH_TOKEN=eyJhbGciOi...
+TURSO_DATABASE_URL = os.getenv("TURSO_DATABASE_URL", "")
+TURSO_AUTH_TOKEN = os.getenv("TURSO_AUTH_TOKEN", "")
+
+# 로컬 SQLite 파일 경로 (Turso sync용 로컬 복제본, 또는 폴백)
 DB_PATH = os.path.join(os.path.dirname(__file__), "protein_data.db")
 
 # sequences/: 아미노산 서열 FASTA 파일 저장 폴더
