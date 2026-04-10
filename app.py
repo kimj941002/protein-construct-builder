@@ -294,22 +294,12 @@ def build_grid_dataframe(structures: list[dict]) -> pd.DataFrame:
 # Ag-Grid 옵션 빌더
 # ─────────────────────────────────────────────
 def build_grid_options(df: pd.DataFrame):
-    # PDB ID 셀에 RCSB 링크 렌더러
+    # PDB ID 셀에 RCSB 링크 렌더러 (함수 기반 — 호환성 우수)
     pdb_link_renderer = JsCode("""
-        class PdbLinkRenderer {
-            init(params) {
-                this.eGui = document.createElement('a');
-                this.eGui.innerText = params.value;
-                this.eGui.setAttribute(
-                    'href',
-                    'https://www.rcsb.org/structure/' + params.value
-                );
-                this.eGui.setAttribute('target', '_blank');
-                this.eGui.style.color = '#1a73e8';
-                this.eGui.style.textDecoration = 'none';
-                this.eGui.style.fontWeight = 'bold';
-            }
-            getGui() { return this.eGui; }
+        function(params) {
+            return '<a href="https://www.rcsb.org/structure/' + params.value
+                + '" target="_blank" style="color:#1a73e8;text-decoration:none;font-weight:bold;">'
+                + params.value + '</a>';
         }
     """)
 
@@ -319,30 +309,35 @@ def build_grid_options(df: pd.DataFrame):
             f'<option value="{v}">{v}</option>'
             for v in values
         )
+        # IIFE로 감싸서 class 참조를 확실히 반환 (JsCode 평가 방식에 무관하게 동작)
         return JsCode(f"""
-            class {class_name} {{
-                init(params) {{
-                    this.eGui = document.createElement('select');
-                    this.eGui.className = 'ag-input-field-input';
-                    this.eGui.style.width = '100%';
-                    this.eGui.style.height = '100%';
-                    this.eGui.style.margin = '0';
-                    this.eGui.style.padding = '0 4px';
-                    this.eGui.style.boxSizing = 'border-box';
-                    this.eGui.style.cursor = 'pointer';
-                    this.eGui.innerHTML = '<option value="">(전체)</option>{opts}';
-                    this.eGui.addEventListener('change', () => {{
-                        const val = this.eGui.value;
-                        if (val === '') {{
-                            params.parentFilterInstance(i => i.setModel(null));
-                        }} else {{
-                            params.parentFilterInstance(i => i.setModel({{
-                                filterType: 'text',
-                                type: 'equals',
-                                filter: val,
-                            }}));
-                        }}
-                        params.api.onFilterChanged();
+            (function() {{
+                class {class_name} {{
+                    init(params) {{
+                        this.eGui = document.createElement('select');
+                        this.eGui.className = 'ag-input-field-input';
+                        this.eGui.style.width = '100%';
+                        this.eGui.style.height = '100%';
+                        this.eGui.style.margin = '0';
+                        this.eGui.style.padding = '0 4px';
+                        this.eGui.style.boxSizing = 'border-box';
+                        this.eGui.style.cursor = 'pointer';
+                        this.eGui.innerHTML = '<option value="">(전체)</option>{opts}';
+                        this.eGui.addEventListener('change', () => {{
+                            const val = this.eGui.value;
+                            if (val === '') {{
+                                params.parentFilterInstance(i => i.setModel(null));
+                            }} else {{
+                                params.parentFilterInstance(i => i.setModel({{
+                                    filterType: 'text',
+                                    type: 'equals',
+                                    filter: val,
+                                }}));
+                            }}
+                            if (params.api && params.api.onFilterChanged) {{
+                                params.api.onFilterChanged();
+                            }}
+                        }});
                     }});
                 }}
                 getGui() {{ return this.eGui; }}
@@ -350,6 +345,8 @@ def build_grid_options(df: pd.DataFrame):
                     this.eGui.value = (model && model.filter) ? model.filter : '';
                 }}
             }}
+            return {class_name};
+        }}())
         """)
 
     method_values  = sorted(df["Method"].dropna().unique().tolist())
@@ -784,7 +781,58 @@ if not search_clicked:
 # ── 구조 목록 로드 ───────────────────────────
 structures = get_structures_by_uniprot(uniprot_id)
 if not structures:
-    st.info("수집된 PDB 구조가 없습니다. 검색 버튼을 눌러주세요.")
+    st.warning("수집된 PDB 구조가 없습니다. 검색 버튼을 눌러주세요.")
+
+    # 재수집 버튼: 단백질 정보 + PDB 구조를 다시 가져옴
+    if st.button("🔄 PDB 데이터 재수집", key="refetch_pdb", use_container_width=False):
+        _gene = protein_data.get("gene_name") or uniprot_id
+        session = create_cached_session()
+
+        with st.spinner("UniProt에서 단백질 정보 재수집 중..."):
+            _new_data, _pdb_ids, _msg = fetch_protein(_gene, session=session)
+
+        if not _new_data:
+            st.error(f"단백질 정보 수집 실패: {_msg}")
+            st.stop()
+
+        st.session_state["protein_data"] = _new_data
+
+        if _pdb_ids:
+            _bar = st.progress(0)
+            _status = st.empty()
+
+            def _refetch_progress(cur, tot):
+                _bar.progress(int(cur / tot * 100))
+                _status.text(f"{cur}/{tot} 처리 중...")
+
+            _collected = fetch_all_structures(
+                _pdb_ids, _new_data["uniprot_id"],
+                progress_callback=_refetch_progress,
+            )
+            _bar.progress(100)
+
+            if _collected:
+                _status.text(f"완료: {len(_collected)}개 구조 수집됨")
+                # 복합체 정보 수집
+                for _s in _collected:
+                    try:
+                        _ed = api_call_with_retry(
+                            f"{RCSB_ENTRY_API}/{_s['structure_id']}", session=session
+                        )
+                        if _ed:
+                            process_complex(
+                                _s["structure_id"], _new_data["uniprot_id"],
+                                _ed, session=session,
+                            )
+                    except Exception:
+                        pass
+            else:
+                _status.text("수집된 구조가 없습니다.")
+        else:
+            st.error("PDB ID를 찾을 수 없습니다. 네트워크 연결을 확인하세요.")
+
+        st.rerun()
+
     st.stop()
 
 # ── Ag-Grid ──────────────────────────────────
@@ -794,22 +842,41 @@ df = build_grid_dataframe(structures)
 
 st.caption("열 헤더 아래 필터 입력창을 사용하세요. Method·Complex는 드롭다운으로 선택됩니다.")
 
-go = build_grid_options(df)
+_use_aggrid = True
+grid_response = None
+try:
+    go = build_grid_options(df)
 
-grid_response = AgGrid(
-    df,
-    gridOptions=go,
-    data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
-    update_mode=GridUpdateMode.MODEL_CHANGED,
-    fit_columns_on_grid_load=False,
-    theme="streamlit",
-    height=480,
-    allow_unsafe_jscode=True,
-    enable_enterprise_modules=False,
-)
+    grid_response = AgGrid(
+        df,
+        gridOptions=go,
+        data_return_mode=DataReturnMode.FILTERED_AND_SORTED,
+        update_mode=GridUpdateMode.MODEL_CHANGED,
+        fit_columns_on_grid_load=False,
+        theme="alpine",
+        height=480,
+        allow_unsafe_jscode=True,
+        enable_enterprise_modules=False,
+        key=f"pdb_grid_{uniprot_id}",
+    )
+except Exception as _ag_err:
+    st.warning(f"Ag-Grid 렌더링 오류가 발생하여 기본 테이블로 전환합니다. ({_ag_err})")
+    _use_aggrid = False
+
+if not _use_aggrid or grid_response is None:
+    st.dataframe(df, use_container_width=True, height=480, hide_index=True)
+    _use_aggrid = False
 
 # ── 내보내기 (드롭다운 + Ag-Grid 필터 모두 적용된 결과) ──
-filtered_df = pd.DataFrame(grid_response["data"])
+if _use_aggrid and grid_response is not None:
+    try:
+        _resp_data = grid_response["data"] if isinstance(grid_response, dict) else grid_response.data
+        filtered_df = pd.DataFrame(_resp_data)
+    except (KeyError, TypeError, AttributeError):
+        filtered_df = df
+else:
+    filtered_df = df
+
 row_count   = len(filtered_df)
 gene_name   = protein_data.get("gene_name", "protein")
 date_str    = datetime.today().strftime("%Y%m%d")
@@ -883,7 +950,14 @@ if _selected_chat_id:
                     st.warning(f"부분 실행 후 오류: {_chat['error']}")
 
 # ── 상세 패널 (행 선택 시) ───────────────────
-selected_rows = grid_response.get("selected_rows")
+if not _use_aggrid or grid_response is None:
+    st.stop()
+
+try:
+    selected_rows = grid_response["selected_rows"] if isinstance(grid_response, dict) else grid_response.selected_rows
+except (KeyError, TypeError, AttributeError):
+    selected_rows = None
+
 if selected_rows is None or (hasattr(selected_rows, "__len__") and len(selected_rows) == 0):
     st.stop()
 
