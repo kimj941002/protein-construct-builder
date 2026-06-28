@@ -106,6 +106,9 @@ class State(rx.State):
     analyzing: bool = False
     analyze_status: str = ""
     analyze_result_md: str = ""
+    # 업로드 진행 표시
+    uploading: bool = False
+    upload_progress: int = 0
 
     # Phase 3 — Knowledge Base
     kb_topics: list[dict] = []
@@ -312,6 +315,13 @@ class State(rx.State):
 
     # ── Phase 2: 논문 업로드 + 분석 ──
     @rx.event
+    def on_upload_progress(self, prog: dict):
+        """업로드 전송 진행률(0~100%) 표시."""
+        p = prog.get("progress", 0) or 0
+        self.upload_progress = round(p * 100)
+        self.uploading = self.upload_progress < 100
+
+    @rx.event
     async def handle_pdf_upload(self, files: list[rx.UploadFile]):
         if not files:
             return
@@ -325,6 +335,9 @@ class State(rx.State):
         self.uploaded_name = getattr(f, "name", None) or getattr(f, "filename", "") or "uploaded.pdf"
         self.analyze_result_md = ""
         self.analyze_status = ""
+        self.cond_status = ""
+        self.uploading = False
+        self.upload_progress = 100
 
     def _do_analysis(self, pdf: str, targets: list[str]) -> dict:
         """(스레드) 분석 실행 + papers/paper_analysis 저장."""
@@ -741,17 +754,27 @@ def _pdb_detail_panel() -> rx.Component:
             rx.text("이 PDB 를 발표한 논문 PDF 를 업로드하면 주제·통찰 + 실험 세부조건을 정리합니다.",
                     color_scheme="gray", size="2"),
             rx.upload(
-                rx.hstack(rx.icon("upload"), rx.text("PDF 선택/끌어놓기"), align="center"),
+                rx.vstack(
+                    rx.icon("file-up", size=26),
+                    rx.text("여기를 클릭해 논문 PDF 선택 (선택 즉시 업로드)", size="2"),
+                    align="center", spacing="1",
+                ),
                 id="pdf_cond", accept={"application/pdf": [".pdf"]}, max_files=1,
-                border="1px dashed var(--gray-7)", padding="0.75rem", border_radius="8px", width="320px",
+                on_drop=State.handle_pdf_upload(
+                    rx.upload_files(upload_id="pdf_cond",
+                                    on_upload_progress=State.on_upload_progress)
+                ),
+                border="2px dashed var(--accent-8)", padding="1.1rem",
+                border_radius="10px", width="360px", cursor="pointer",
             ),
-            rx.hstack(
-                rx.button("업로드", on_click=State.handle_pdf_upload(rx.upload_files(upload_id="pdf_cond"))),
-                rx.button("🔬 구조화 분석", on_click=State.run_pdb_conditions, disabled=State.cond_analyzing),
-                spacing="2",
-            ),
-            rx.cond(State.uploaded_name != "", rx.text("업로드됨: " + State.uploaded_name,
-                                                       color_scheme="green", size="2")),
+            rx.cond(State.uploading,
+                    rx.hstack(rx.spinner(),
+                              rx.text("업로드 중... " + State.upload_progress.to_string() + "%"),
+                              spacing="2")),
+            rx.cond(State.uploaded_name != "",
+                    rx.text("✅ 업로드됨: " + State.uploaded_name, color_scheme="green", size="2")),
+            rx.button("🔬 구조화 분석", on_click=State.run_pdb_conditions,
+                      disabled=State.cond_analyzing | (State.uploaded_name == "")),
             rx.cond(State.cond_analyzing, rx.hstack(rx.spinner(), rx.text(State.cond_status), spacing="2")),
             rx.cond((~State.cond_analyzing) & (State.cond_status != ""),
                     rx.text(State.cond_status, size="2")),
