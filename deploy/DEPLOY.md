@@ -1,72 +1,53 @@
-# 배포 가이드 — 내 컴퓨터 + Cloudflare Tunnel + 공유 비밀번호
+# 배포 가이드 (간단) — Reflex Cloud + 공유 비밀번호
 
-소수(1~10명)에게 **링크 + 공유 비밀번호**로만 접속을 허용하는 가장 단순한 방법.
+내 PC를 켜둘 필요도, Caddy·Cloudflare·터미널 3개도 **전혀 필요 없음.**
+Reflex Cloud가 호스팅·HTTPS·고정 URL을 다 해주고, 우리가 만든 **비밀번호 게이트**로 접근을 막는다.
 
 ```
-[유저] ──https──▶ [Cloudflare] ──터널──▶ [내 PC: Caddy :8080] ──▶ Reflex(프론트3000 + 백엔드8000)
-                                                                     ▲ 앱 내 '공유 비밀번호' 로그인 게이트
+[유저] ──https──▶ [Reflex Cloud (고정 URL)] ──▶ 앱
+                                                 ▲ 공유 비밀번호 입력해야 입장
 ```
-- **접근 제한**: 앱에 들어오면 비밀번호 화면이 먼저 뜸 → 비밀번호 아는 사람만 입장.
-- **데이터**: 모두 같은 Supabase 를 공유(공동 지식베이스). PC 가 켜져 있어야 접속 가능.
 
 ---
 
-## 0. 준비물 (1회)
-- Cloudflare 계정(무료) + **Cloudflare 에 등록된 도메인 1개** (안정적인 고정 링크용)
-  - 도메인이 없으면 → 맨 아래 "도메인 없이(임시 링크)" 참고.
-- 설치: **Caddy** (`https://caddyserver.com/download`), **cloudflared** (`https://github.com/cloudflare/cloudflared/releases`)
+## 준비 (1회)
+- `APP_PASSWORD`(공유 비밀번호)가 `.streamlit/secrets.toml` 에 채워져 있어야 함.
+  - 보안 팁: **DB 비밀번호와는 다른 값**으로 두세요(이 값은 협업자에게 공유되니까).
 
-## 1. 비밀키 설정
-`.streamlit/secrets.toml` (이미 .gitignore 됨) 에:
-```toml
-ANTHROPIC_API_KEY    = "sk-ant-..."
-SUPABASE_DB_PASSWORD = "실제_DB_비밀번호"
-SUPABASE_PROJECT_REF = "izgdypalbnauzidoffyx"
-SUPABASE_POOLER_HOST = "aws-1-ap-northeast-2.pooler.supabase.com"
-APP_PASSWORD         = "공유할_강력한_비밀번호"   # ← 이걸 아는 사람만 입장
-```
-> `APP_PASSWORD` 가 비어 있으면 게이트가 꺼집니다(로컬 개발용). 배포 땐 반드시 채우세요.
+## 딱 3단계
 
-## 2. Reflex 앱을 prod 로 실행 (터미널 A)
+### 1) Reflex 계정 로그인 (무료, 1회)
 ```powershell
 cd D:\Projects\Project_PDB\protein-construct-builder
-pip install -r requirements-reflex.txt
-$env:API_URL = "https://pdb.example.com"   # ← 본인 공개 도메인
-python -X utf8 -m reflex run --env prod
+python -X utf8 -m reflex login
 ```
-→ 프론트 `:3000`, 백엔드 `:8000` 가동.
+→ 브라우저가 열리면 가입/로그인. (무료)
 
-## 3. Caddy 실행 (터미널 B) — 두 포트를 8080 하나로 합침
+### 2) 비밀값을 배포용 파일로 변환 (자동)
 ```powershell
-cd D:\Projects\Project_PDB\protein-construct-builder
-caddy run --config deploy/Caddyfile
+python deploy/make_env.py
 ```
-→ `http://localhost:8080` 에서 앱 전체가 보이면 성공.
+→ `secrets.toml` 의 APP_PASSWORD·Supabase·Anthropic 키를 `prod.env` 로 모아줌. (깃에 안 올라감)
 
-## 4. Cloudflare Tunnel (터미널 C)
+### 3) 배포
 ```powershell
-cloudflared login
-cloudflared tunnel create pdb-app
-# 생성된 <TUNNEL_ID> 로 deploy/cloudflared-config.example.yml 을 채워 ~/.cloudflared/config.yml 로 저장
-cloudflared tunnel route dns pdb-app pdb.example.com
-cloudflared tunnel run pdb-app
+python -X utf8 -m reflex deploy --app-name pdb-builder --envfile prod.env
 ```
-→ 이제 `https://pdb.example.com` 으로 외부에서 접속 가능.
+→ 빌드 후 **고정 URL** 을 출력합니다 (예: `https://pdb-builder-....reflex.run`).
+   처음엔 지역(region) 등을 한 번 물어볼 수 있어요 — 적당히 선택하면 됩니다.
 
-## 5. 공유
-협업자에게 **링크(`https://pdb.example.com`) + 공유 비밀번호** 를 전달. 그 둘을 아는 사람만 입장.
+> 코드를 고친 뒤 다시 배포하려면 같은 3) 명령만 다시 실행하면 됩니다 (URL 그대로 유지).
+
+## 공유
+출력된 **고정 URL + 공유 비밀번호(APP_PASSWORD)** 를 협업자에게 전달.
+→ 둘 다 아는 사람만 입장. 내 PC가 꺼져 있어도 24시간 접속됩니다.
 
 ---
 
-## 도메인 없이 (임시 링크, 0설정)
-2·3번까지 한 뒤:
-```powershell
-cloudflared tunnel --url http://localhost:8080
-```
-→ `https://랜덤문자.trycloudflare.com` 링크가 출력됨. 재시작하면 주소가 바뀝니다(임시용).
-이때 2번의 `$env:API_URL` 을 출력된 그 주소로 맞춰 다시 실행해야 합니다.
+## 참고 / 한계
+- **무료 한도**: Reflex Cloud 무료 티어로 시작 가능. 사용량이 많아지면 유료로 올려야 할 수 있음(대시보드에서 확인).
+- **메모리**: 지식베이스 의미검색은 임베딩 모델(약 120MB)을 메모리에 올립니다. 무료 인스턴스가 작아 느리거나 버벅이면, 그 기능만 영향(나머지는 정상). 필요 시 인스턴스 크기를 올리세요.
+- **비밀번호 1개** 방식이라 유출되면 누구나 들어옵니다. 더 강한 통제가 필요하면 이메일 허용목록(Cloudflare Access)·Supabase Auth 로 확장 가능.
 
-## 보안 메모
-- `secrets.toml` 은 절대 깃에 올리지 않음(이미 .gitignore). 비밀번호 유출 시 `APP_PASSWORD` 교체.
-- 공유 비밀번호 1개라 "유출되면 누구나" 들어옵니다. 더 강한 통제가 필요해지면 Cloudflare Access(이메일 허용목록)나 Supabase Auth 로 올릴 수 있음.
-- PC 가 꺼지면 접속 불가 → 24시간 필요하면 작은 VPS 로 옮기는 걸 권장(같은 구성 그대로).
+## (고급) 내 PC에서 직접 호스팅하고 싶다면
+Reflex Cloud 대신 자체 호스팅을 원하면 Caddy + Cloudflare Tunnel 방식도 가능합니다(더 복잡). 필요하면 별도 안내드립니다.

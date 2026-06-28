@@ -9,3 +9,8 @@ python-dotenv>=1.0.0
 pypdf>=4.0.0
 sqlalchemy>=2.0
 psycopg2-binary>=2.9
+
+reflex==0.9.6.post1
+# Reflex 통합 앱(논문분석·지식베이스 의미검색)용 — 클라우드 배포에 필요
+PyMuPDF>=1.24.0
+fastembed>=0.3.0
