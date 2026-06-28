@@ -176,6 +176,38 @@ class State(rx.State):
                 self.analyze_status = "분석 완료 — Supabase(papers/paper_analysis) 저장됨"
                 self.analyze_result_md = res["output_md"]
 
+    # ── 독립 Paper Analyzer (구조 연결 없이 papers 저장) ──
+    def _do_standalone(self, pdf: str) -> dict:
+        from paper_pipeline import run_full_analysis
+        from paper_store import PaperStore
+        r = run_full_analysis(pdf, model="claude-sonnet-4-6", lang="ko")
+        if r.get("error"):
+            return r
+        PaperStore().save(
+            pdf_path=pdf, analysis_md=r["output_md"], result=r["result"],
+            model="claude-sonnet-4-6", lang="ko", cost=r.get("cost", 0.0),
+            doi=r.get("doi", ""), structure_id=None,
+        )
+        return {"output_md": r["output_md"]}
+
+    @rx.event(background=True)
+    async def run_standalone_analysis(self):
+        async with self:
+            if not self.uploaded_pdf_path:
+                self.analyze_status = "PDF 를 먼저 업로드하세요."
+                return
+            self.analyzing = True
+            self.analyze_status = "논문 분석 중... (수 분 소요)"
+            pdf = self.uploaded_pdf_path
+        res = await asyncio.to_thread(self._do_standalone, pdf)
+        async with self:
+            self.analyzing = False
+            if res.get("error"):
+                self.analyze_status = "오류: " + res["error"]
+            else:
+                self.analyze_status = "분석 완료 — Supabase(papers) 저장됨"
+                self.analyze_result_md = res["output_md"]
+
 
 # ═══════════════════════════════════════════
 # AG Grid 컬럼
@@ -353,8 +385,50 @@ def _placeholder(title: str, desc: str) -> rx.Component:
     )
 
 
+def analyzer_content() -> rx.Component:
+    return rx.vstack(
+        rx.heading("Paper Analyzer", size="7"),
+        rx.text("논문 PDF 를 업로드하면 4단계로 분석합니다 (PDB 연결 없이 독립 저장).",
+                color_scheme="gray"),
+        rx.upload(
+            rx.vstack(rx.icon("upload"), rx.text("PDF 끌어다 놓기 또는 클릭"), align="center"),
+            id="pdf_up_standalone",
+            accept={"application/pdf": [".pdf"]},
+            max_files=1,
+            border="1px dashed var(--gray-7)",
+            padding="1rem", width="340px", border_radius="8px",
+        ),
+        rx.button(
+            "이 PDF 업로드",
+            on_click=State.handle_pdf_upload(rx.upload_files(upload_id="pdf_up_standalone")),
+        ),
+        rx.cond(
+            State.uploaded_name != "",
+            rx.text("업로드됨: " + State.uploaded_name, color_scheme="green"),
+        ),
+        rx.button("🔬 분석 시작", on_click=State.run_standalone_analysis, disabled=State.analyzing),
+        rx.cond(
+            State.analyzing,
+            rx.hstack(rx.spinner(), rx.text(State.analyze_status), spacing="2"),
+        ),
+        rx.cond(
+            (~State.analyzing) & (State.analyze_status != ""),
+            rx.text(State.analyze_status),
+        ),
+        rx.cond(
+            State.analyze_result_md != "",
+            rx.box(
+                rx.markdown(State.analyze_result_md),
+                border="1px solid var(--gray-5)", border_radius="8px",
+                padding="1rem", width="100%", max_height="600px", overflow="auto",
+            ),
+        ),
+        spacing="3", align="start", width="100%",
+    )
+
+
 def analyzer_page() -> rx.Component:
-    return _placeholder("Paper Analyzer", "준비 중 — Phase 2 에서 구현합니다 (PDF 업로드 → 4단계 분석).")
+    return layout(analyzer_content())
 
 
 def knowledge_page() -> rx.Component:
