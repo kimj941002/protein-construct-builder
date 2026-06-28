@@ -26,10 +26,25 @@ from collect import collect_protein
 import knowledge as K
 
 
+def _app_password() -> str:
+    """공유 접속 비밀번호 (secrets/env 의 APP_PASSWORD). 미설정이면 게이트 비활성(로컬 개발)."""
+    try:
+        from db_config import _load_secrets
+        return str(_load_secrets().get("APP_PASSWORD", "") or "")
+    except Exception:
+        import os
+        return os.environ.get("APP_PASSWORD", "")
+
+
 # ═══════════════════════════════════════════
 # State
 # ═══════════════════════════════════════════
 class State(rx.State):
+    # 접속 게이트 (공유 비밀번호)
+    authenticated: bool = False
+    password_input: str = ""
+    auth_error: str = ""
+
     query: str = ""
     collecting: bool = False
     collect_status: str = ""
@@ -70,6 +85,25 @@ class State(rx.State):
     @rx.var
     def selected_count(self) -> int:
         return len(self.selected_structure_ids)
+
+    @rx.var
+    def gate_open(self) -> bool:
+        """비밀번호 미설정(로컬)이면 통과, 설정됐으면 로그인해야 통과."""
+        return self.authenticated or not bool(_app_password())
+
+    @rx.event
+    def set_password_input(self, v: str):
+        self.password_input = v
+
+    @rx.event
+    def do_login(self):
+        pw = _app_password()
+        if pw and self.password_input == pw:
+            self.authenticated = True
+            self.auth_error = ""
+            self.password_input = ""
+        else:
+            self.auth_error = "비밀번호가 올바르지 않습니다."
 
     # ── 내부 헬퍼 (동기) ──
     def _apply_protein(self, uid: str):
@@ -421,11 +455,32 @@ def sidebar() -> rx.Component:
     )
 
 
+def _login_view() -> rx.Component:
+    return rx.center(
+        rx.vstack(
+            rx.heading("🔒 Protein Construct Builder", size="6"),
+            rx.text("접속하려면 공유 비밀번호를 입력하세요.", color_scheme="gray"),
+            rx.input(
+                value=State.password_input, on_change=State.set_password_input,
+                placeholder="비밀번호", type="password", width="280px",
+            ),
+            rx.button("들어가기", on_click=State.do_login, width="280px"),
+            rx.cond(State.auth_error != "", rx.text(State.auth_error, color_scheme="red")),
+            spacing="3", align="center",
+        ),
+        height="100vh", width="100%",
+    )
+
+
 def layout(content: rx.Component) -> rx.Component:
-    return rx.hstack(
-        sidebar(),
-        rx.box(content, padding="1.5rem", width="100%", flex="1"),
-        align="start", width="100%", spacing="0",
+    return rx.cond(
+        State.gate_open,
+        rx.hstack(
+            sidebar(),
+            rx.box(content, padding="1.5rem", width="100%", flex="1"),
+            align="start", width="100%", spacing="0",
+        ),
+        _login_view(),
     )
 
 

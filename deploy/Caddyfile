@@ -1,0 +1,13 @@
+# Caddy 리버스 프록시 — Reflex 앱(프론트 3000 + 백엔드 8000)을 한 포트(8080)로 합친다.
+# Cloudflare Tunnel 이 이 8080 으로 연결한다. TLS 는 Cloudflare 가 처리하므로 여기선 http.
+#
+# 사용: caddy run --config deploy/Caddyfile
+
+:8080 {
+    # 백엔드(웹소켓/이벤트/업로드/헬스)는 Reflex 백엔드(8000)로
+    @backend path /_event* /_upload* /ping
+    reverse_proxy @backend localhost:8000
+
+    # 그 외 전부는 프론트엔드(3000)로
+    reverse_proxy localhost:3000
+}

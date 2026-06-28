@@ -1,0 +1,12 @@
+# Cloudflare Tunnel 설정 예시 — ~/.cloudflared/config.yml 에 둔다.
+# <TUNNEL_ID> / 도메인은 본인 값으로 교체.
+
+tunnel: <TUNNEL_ID>
+credentials-file: C:\Users\jk941\.cloudflared\<TUNNEL_ID>.json
+
+ingress:
+  # 공개 주소 → 로컬 Caddy(8080) → Reflex(프론트3000+백엔드8000)
+  - hostname: pdb.example.com
+    service: http://localhost:8080
+  # 그 외는 404
+  - service: http_status:404
