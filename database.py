@@ -265,6 +265,24 @@ def get_mutations_by_structure(structure_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_mutations_bulk(structure_ids: list[str]) -> dict[str, list[dict]]:
+    """
+    여러 structure_id의 mutation을 한 번의 쿼리로 조회합니다 (N+1 방지).
+    Returns: {structure_id: [mutation dict, ...], ...}  (mutation 없으면 키 없음)
+    """
+    if not structure_ids:
+        return {}
+    stmt = text(
+        "SELECT * FROM structure_mutations WHERE structure_id IN :ids"
+    ).bindparams(bindparam("ids", expanding=True))
+    with get_engine().connect() as conn:
+        rows = conn.execute(stmt, {"ids": list(structure_ids)}).mappings().all()
+    result: dict[str, list[dict]] = {}
+    for r in rows:
+        result.setdefault(r["structure_id"], []).append(dict(r))
+    return result
+
+
 def delete_mutations_by_structure(structure_id: str):
     with get_engine().begin() as conn:
         conn.execute(

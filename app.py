@@ -22,6 +22,7 @@ from database import (
     get_klifs_bulk,
     get_ligands_by_structure,
     get_mutations_by_structure,
+    get_mutations_bulk,
     get_oligosaccharides_by_structure,
     get_paper_analysis,
     get_partners_by_structure,
@@ -206,13 +207,14 @@ def ensure_complex_data(pdb_id: str, target_uniprot_id: str, complex_type: str):
 # 구조 목록 → DataFrame 변환
 # ─────────────────────────────────────────────
 def build_grid_dataframe(structures: list[dict]) -> pd.DataFrame:
-    # KLIFS 데이터를 한 번에 조회 (N+1 쿼리 방지)
+    # KLIFS·Mutation 데이터를 한 번에 조회 (N+1 쿼리 방지)
     sids      = [s["structure_id"] for s in structures]
     klifs_map = get_klifs_bulk(sids)
+    mut_map   = get_mutations_bulk(sids)
 
     rows = []
     for s in structures:
-        muts    = get_mutations_by_structure(s["structure_id"])
+        muts    = mut_map.get(s["structure_id"], [])
         mut_str = "; ".join(m["mutation"] for m in muts) if muts else "-"
         k       = klifs_map.get(s["structure_id"])  # None if not a kinase
         rows.append({
