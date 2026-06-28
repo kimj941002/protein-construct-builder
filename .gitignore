@@ -13,6 +13,12 @@ __pycache__/
 *.py[cod]
 *$py.class
 
+# Reflex 빌드 산출물 (Stage 3)
+.web/
+.states/
+reflex.lock/
+*.reflex.json
+
 # 환경 설정 (로컬 전용 — 절대 GitHub에 올리지 말 것)
 .env
 *.env

@@ -1,0 +1,5 @@
+# Stage 3 — Reflex 앱 전용 의존성 (Streamlit requirements.txt 와 분리 관리)
+# 서비스 계층(database.py, db_config.py)만 재사용하므로 streamlit/aggrid 불필요.
+reflex>=0.9
+sqlalchemy>=2.0
+psycopg2-binary>=2.9
