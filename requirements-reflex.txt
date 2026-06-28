@@ -3,3 +3,5 @@
 reflex>=0.9
 sqlalchemy>=2.0
 psycopg2-binary>=2.9
+# AG Grid 표는 자체 래퍼(pcb_reflex/ag_grid_wrap.py)가 npm의 ag-grid-react / ag-grid-community 를
+# 자동 설치한다 — 추가 파이썬 패키지·계정 로그인 불필요.

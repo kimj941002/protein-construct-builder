@@ -13,6 +13,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import reflex as rx
 
+from .ag_grid_wrap import ag_grid
+
 from database import (
     get_all_proteins,
     get_protein,
@@ -30,6 +32,7 @@ class State(rx.State):
     organism: str = ""
     seq_length: int = 0
     structures: list[dict] = []
+    selected_structure_ids: list[str] = []   # AG Grid 다중선택 결과 (Phase 2 논문분석용)
 
     @rx.var
     def protein_uids(self) -> list[str]:
@@ -43,6 +46,13 @@ class State(rx.State):
     def load_proteins(self):
         """페이지 진입 시 수집된 단백질 목록 로드 (서비스 계층)."""
         self.proteins = get_all_proteins()
+
+    @rx.event
+    def on_select_structures(self, rows: list[dict]):
+        """AG Grid 다중선택 → 선택된 structure_id 보관 (Phase 2 PDB 논문분석)."""
+        self.selected_structure_ids = [
+            r.get("structure_id") for r in rows if r.get("structure_id")
+        ]
 
     @rx.event
     def select_protein(self, uid: str):
@@ -66,38 +76,38 @@ class State(rx.State):
         self.structures = structs
 
 
-def _structure_row(s: dict) -> rx.Component:
-    return rx.table.row(
-        rx.table.cell(
-            rx.link(
-                s["structure_id"],
-                href=s["rcsb_url"],
-                is_external=True,
-            )
-        ),
-        rx.table.cell(s["method"]),
-        rx.table.cell(s["resolution_str"]),
-        rx.table.cell(s["complex_type"]),
-        rx.table.cell(s["chain_id"]),
-        rx.table.cell(s["mutations_str"]),
-    )
+# AG Grid 컬럼 정의 — 기존 Streamlit 구조 표와 동일 구성 (정렬/필터)
+_COLUMN_DEFS = [
+    {"field": "structure_id", "headerName": "PDB ID", "pinned": "left", "filter": True,
+     "checkboxSelection": True, "headerCheckboxSelection": True, "minWidth": 120},
+    {"field": "method", "headerName": "Method", "filter": True},
+    {"field": "resolution", "headerName": "Res (Å)", "filter": "agNumberColumnFilter", "maxWidth": 110},
+    {"field": "complex_type", "headerName": "Complex", "filter": True},
+    {"field": "chain_id", "headerName": "Chain", "filter": True, "maxWidth": 100},
+    {"field": "residue_range", "headerName": "Residue Range", "filter": True},
+    {"field": "mutations_str", "headerName": "Mutations", "filter": True},
+    {"field": "expression_system", "headerName": "Organism", "filter": True},
+    {"field": "host_cell_line", "headerName": "Expr System", "filter": True},
+    {"field": "space_group", "headerName": "Space Group", "filter": True},
+    {"field": "deposition_date", "headerName": "Deposit Date", "filter": True},
+    {"field": "doi", "headerName": "DOI", "filter": True},
+]
 
 
-def _structures_table() -> rx.Component:
-    return rx.table.root(
-        rx.table.header(
-            rx.table.row(
-                rx.table.column_header_cell("PDB ID"),
-                rx.table.column_header_cell("Method"),
-                rx.table.column_header_cell("Res (Å)"),
-                rx.table.column_header_cell("Complex"),
-                rx.table.column_header_cell("Chain"),
-                rx.table.column_header_cell("Mutations"),
-            )
+def _structures_grid() -> rx.Component:
+    """AG Grid 구조 표 (자체 래퍼) — 정렬·필터·다중선택. 테마 클래스+높이는 래퍼 div 에."""
+    return rx.box(
+        ag_grid(
+            column_defs=_COLUMN_DEFS,
+            row_data=State.structures,
+            default_col_def={"sortable": True, "resizable": True, "floatingFilter": True},
+            row_selection="multiple",
+            pagination=True,
+            pagination_page_size=20,
+            on_selection_changed=State.on_select_structures,
         ),
-        rx.table.body(rx.foreach(State.structures, _structure_row)),
-        variant="surface",
         width="100%",
+        height="600px",
     )
 
 
@@ -127,7 +137,7 @@ def index() -> rx.Component:
                     rx.heading(
                         "PDB 구조 " + State.structure_count.to_string() + "개", size="4"
                     ),
-                    _structures_table(),
+                    _structures_grid(),
                     spacing="2",
                     width="100%",
                     align="start",
