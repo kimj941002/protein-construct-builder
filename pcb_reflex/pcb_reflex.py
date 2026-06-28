@@ -35,6 +35,7 @@ from database import (
 from uniprot_fetcher import load_sequence_from_file
 from collect import collect_protein
 import knowledge as K
+import customllm as CL
 
 # 도메인 트랙 색상
 _DOMAIN_COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3",
@@ -119,6 +120,17 @@ class State(rx.State):
     kb_search_results: list[dict] = []
     kb_busy: bool = False
     kb_status: str = ""
+
+    # R4 — Custom LLM (트리 대화)
+    llm_rooms: list[dict] = []
+    llm_selected_room_id: int = 0
+    llm_selected_title: str = ""
+    llm_messages: list[dict] = []
+    llm_input: str = ""
+    llm_new_topic: str = ""
+    llm_branch_title: str = ""
+    llm_busy: bool = False
+    llm_status: str = ""
 
     @rx.var
     def structure_count(self) -> int:
@@ -474,6 +486,94 @@ class State(rx.State):
             self.kb_status = ""
             self.kb_search_results = results
 
+    # ── R4: Custom LLM (트리 대화) ──
+    @rx.event
+    def set_llm_input(self, v: str):
+        self.llm_input = v
+
+    @rx.event
+    def set_llm_new_topic(self, v: str):
+        self.llm_new_topic = v
+
+    @rx.event
+    def set_llm_branch_title(self, v: str):
+        self.llm_branch_title = v
+
+    @rx.event
+    def llm_load_rooms(self):
+        self.llm_rooms = CL.list_rooms()
+
+    @rx.event
+    def llm_create_topic(self):
+        t = self.llm_new_topic.strip()
+        if not t:
+            return
+        CL.create_topic_room(t)
+        self.llm_new_topic = ""
+        self.llm_rooms = CL.list_rooms()
+
+    @rx.event
+    def llm_select_room(self, room_id: int, title: str):
+        self.llm_selected_room_id = room_id
+        self.llm_selected_title = title
+        self.llm_messages = CL.get_messages(room_id)
+        self.llm_status = ""
+
+    @rx.event
+    def llm_delete_room(self, room_id: int):
+        CL.delete_room(room_id)
+        if self.llm_selected_room_id == room_id:
+            self.llm_selected_room_id = 0
+            self.llm_messages = []
+        self.llm_rooms = CL.list_rooms()
+
+    @rx.event(background=True)
+    async def llm_send(self):
+        txt = self.llm_input.strip()
+        async with self:
+            if not txt or not self.llm_selected_room_id:
+                return
+            self.llm_busy = True
+            self.llm_status = "LLM 응답 생성 중... (필요 시 DB 조회)"
+            self.llm_input = ""
+            rid = self.llm_selected_room_id
+        await asyncio.to_thread(CL.send_message, rid, txt)
+        async with self:
+            self.llm_busy = False
+            self.llm_status = ""
+            self.llm_messages = CL.get_messages(rid)
+
+    @rx.event(background=True)
+    async def llm_branch(self):
+        async with self:
+            t = self.llm_branch_title.strip()
+            if not t or not self.llm_selected_room_id:
+                self.llm_status = "분화할 소주제 제목 + 현재 방 선택이 필요합니다."
+                return
+            self.llm_busy = True
+            self.llm_status = "소주제 분화 중 (상위 맥락 요약)..."
+            pid = self.llm_selected_room_id
+            self.llm_branch_title = ""
+        await asyncio.to_thread(CL.branch_room, pid, t)
+        async with self:
+            self.llm_busy = False
+            self.llm_status = "분화 완료"
+            self.llm_rooms = CL.list_rooms()
+
+    @rx.event(background=True)
+    async def llm_rollup(self):
+        async with self:
+            if not self.llm_selected_room_id:
+                return
+            self.llm_busy = True
+            self.llm_status = "하위 대화 통찰 종합 중..."
+            rid = self.llm_selected_room_id
+        res = await asyncio.to_thread(CL.rollup_insight, rid)
+        async with self:
+            self.llm_busy = False
+            self.llm_status = res.get("error") or "통찰 종합 완료"
+            self.llm_messages = CL.get_messages(rid)
+
 
 # ═══════════════════════════════════════════
 # AG Grid 컬럼
@@ -796,50 +896,82 @@ def _placeholder(title: str, desc: str) -> rx.Component:
     )
 
 
-def analyzer_content() -> rx.Component:
-    return rx.vstack(
-        rx.heading("Paper Analyzer", size="7"),
-        rx.text("논문 PDF 를 업로드하면 4단계로 분석합니다 (PDB 연결 없이 독립 저장).",
-                color_scheme="gray"),
-        rx.upload(
-            rx.vstack(rx.icon("upload"), rx.text("PDF 끌어다 놓기 또는 클릭"), align="center"),
-            id="pdf_up_standalone",
-            accept={"application/pdf": [".pdf"]},
-            max_files=1,
-            border="1px dashed var(--gray-7)",
-            padding="1rem", width="340px", border_radius="8px",
+def _room_item(r: dict) -> rx.Component:
+    return rx.hstack(
+        rx.text(r["indent"]),
+        rx.button(r["title"], on_click=State.llm_select_room(r["id"], r["title"]),
+                  variant="ghost", size="2"),
+        rx.spacer(),
+        rx.button("🗑", on_click=State.llm_delete_room(r["id"]), variant="ghost", size="1"),
+        width="100%", spacing="1", align="center",
+    )
+
+
+def _msg_item(m: dict) -> rx.Component:
+    return rx.box(
+        rx.text(m["role"], size="1", color_scheme="gray", weight="bold"),
+        rx.markdown(m["content"]),
+        border="1px solid var(--gray-4)", border_radius="8px", padding="0.6rem",
+        width="100%",
+        background=rx.cond(m["role"] == "user", rx.color("accent", 2), rx.color("gray", 2)),
+    )
+
+
+def custom_llm_content() -> rx.Component:
+    return rx.hstack(
+        # 왼쪽: 방 트리
+        rx.vstack(
+            rx.heading("Custom LLM", size="6"),
+            rx.text("주제→소주제로 분화하는 트리 대화. LLM 이 PDB DB·논문분석을 조회해 답합니다.",
+                    color_scheme="gray", size="2"),
+            rx.hstack(
+                rx.input(value=State.llm_new_topic, on_change=State.set_llm_new_topic,
+                         placeholder="새 주제", width="170px"),
+                rx.button("＋주제", on_click=State.llm_create_topic),
+                spacing="1",
+            ),
+            rx.divider(),
+            rx.vstack(rx.foreach(State.llm_rooms, _room_item),
+                      spacing="1", width="100%", align="start"),
+            width="320px", align="start", spacing="2",
+            on_mount=State.llm_load_rooms,
         ),
-        rx.button(
-            "이 PDF 업로드",
-            on_click=State.handle_pdf_upload(rx.upload_files(upload_id="pdf_up_standalone")),
-        ),
+        # 오른쪽: 대화
         rx.cond(
-            State.uploaded_name != "",
-            rx.text("업로드됨: " + State.uploaded_name, color_scheme="green"),
-        ),
-        rx.button("🔬 분석 시작", on_click=State.run_standalone_analysis, disabled=State.analyzing),
-        rx.cond(
-            State.analyzing,
-            rx.hstack(rx.spinner(), rx.text(State.analyze_status), spacing="2"),
-        ),
-        rx.cond(
-            (~State.analyzing) & (State.analyze_status != ""),
-            rx.text(State.analyze_status),
-        ),
-        rx.cond(
-            State.analyze_result_md != "",
-            rx.box(
-                rx.markdown(State.analyze_result_md),
-                border="1px solid var(--gray-5)", border_radius="8px",
-                padding="1rem", width="100%", max_height="600px", overflow="auto",
+            State.llm_selected_room_id != 0,
+            rx.vstack(
+                rx.heading("💬 " + State.llm_selected_title, size="5"),
+                rx.hstack(
+                    rx.input(value=State.llm_branch_title, on_change=State.set_llm_branch_title,
+                             placeholder="이 방에서 분화할 소주제 제목", width="240px"),
+                    rx.button("↳ 분화", on_click=State.llm_branch, disabled=State.llm_busy),
+                    rx.button("⤴ 하위 통찰 종합", on_click=State.llm_rollup, disabled=State.llm_busy),
+                    spacing="2", wrap="wrap",
+                ),
+                rx.cond(State.llm_busy,
+                        rx.hstack(rx.spinner(), rx.text(State.llm_status), spacing="2")),
+                rx.cond((~State.llm_busy) & (State.llm_status != ""),
+                        rx.text(State.llm_status, size="2", color_scheme="gray")),
+                rx.vstack(rx.foreach(State.llm_messages, _msg_item), spacing="2", width="100%"),
+                rx.hstack(
+                    rx.input(value=State.llm_input, on_change=State.set_llm_input,
+                             placeholder="메시지 입력...", width="100%"),
+                    rx.button("전송", on_click=State.llm_send, disabled=State.llm_busy),
+                    width="100%", spacing="2",
+                ),
+                flex="1", align="start", spacing="3", width="100%",
+            ),
+            rx.center(
+                rx.text("왼쪽에서 주제/방을 선택하거나, 새 주제를 만드세요.", color_scheme="gray"),
+                flex="1", min_height="50vh",
             ),
         ),
-        spacing="3", align="start", width="100%",
+        align="start", spacing="4", width="100%",
     )
 
 
 def analyzer_page() -> rx.Component:
-    return layout(analyzer_content())
+    return layout(custom_llm_content())
 
 
 def _search_result(r: dict) -> rx.Component:
