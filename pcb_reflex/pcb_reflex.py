@@ -41,9 +41,20 @@ class State(rx.State):
     structures: list[dict] = []
     selected_structure_ids: list[str] = []
 
+    # Phase 2 — PDB Article Analysis
+    uploaded_pdf_path: str = ""
+    uploaded_name: str = ""
+    analyzing: bool = False
+    analyze_status: str = ""
+    analyze_result_md: str = ""
+
     @rx.var
     def structure_count(self) -> int:
         return len(self.structures)
+
+    @rx.var
+    def selected_count(self) -> int:
+        return len(self.selected_structure_ids)
 
     # ── 내부 헬퍼 (동기) ──
     def _apply_protein(self, uid: str):
@@ -107,6 +118,64 @@ class State(rx.State):
             r.get("structure_id") for r in rows if r.get("structure_id")
         ]
 
+    # ── Phase 2: 논문 업로드 + 분석 ──
+    @rx.event
+    async def handle_pdf_upload(self, files: list[rx.UploadFile]):
+        if not files:
+            return
+        import tempfile
+        f = files[0]
+        data = await f.read()
+        fd, path = tempfile.mkstemp(suffix=".pdf")
+        with os.fdopen(fd, "wb") as out:
+            out.write(data)
+        self.uploaded_pdf_path = path
+        self.uploaded_name = getattr(f, "name", None) or getattr(f, "filename", "") or "uploaded.pdf"
+        self.analyze_result_md = ""
+        self.analyze_status = ""
+
+    def _do_analysis(self, pdf: str, targets: list[str]) -> dict:
+        """(스레드) 분석 실행 + papers/paper_analysis 저장."""
+        from datetime import datetime
+        from paper_pipeline import run_full_analysis
+        from paper_store import PaperStore
+        from database import upsert_paper_analysis
+
+        r = run_full_analysis(pdf, model="claude-sonnet-4-6", lang="ko")
+        if r.get("error"):
+            return r
+        primary = targets[0] if targets else None
+        PaperStore().save(
+            pdf_path=pdf, analysis_md=r["output_md"], result=r["result"],
+            model="claude-sonnet-4-6", lang="ko", cost=r.get("cost", 0.0),
+            doi=r.get("doi", ""), structure_id=primary,
+        )
+        for sid in targets:
+            upsert_paper_analysis({
+                "structure_id": sid, "status": "completed",
+                "raw_text": r["output_md"], "analyzed_at": datetime.now(),
+            })
+        return {"output_md": r["output_md"]}
+
+    @rx.event(background=True)
+    async def run_article_analysis(self):
+        async with self:
+            if not self.uploaded_pdf_path or not self.selected_structure_ids:
+                self.analyze_status = "먼저 PDB 선택 + PDF 업로드가 필요합니다."
+                return
+            self.analyzing = True
+            self.analyze_status = "논문 분석 중... (수 분 소요)"
+            pdf = self.uploaded_pdf_path
+            targets = list(self.selected_structure_ids)
+        res = await asyncio.to_thread(self._do_analysis, pdf, targets)
+        async with self:
+            self.analyzing = False
+            if res.get("error"):
+                self.analyze_status = "오류: " + res["error"]
+            else:
+                self.analyze_status = "분석 완료 — Supabase(papers/paper_analysis) 저장됨"
+                self.analyze_result_md = res["output_md"]
+
 
 # ═══════════════════════════════════════════
 # AG Grid 컬럼
@@ -141,6 +210,56 @@ def _structures_grid() -> rx.Component:
         ),
         width="100%",
         height="600px",
+    )
+
+
+def _article_analysis_panel() -> rx.Component:
+    """선택한 PDB 의 논문 PDF 업로드 → 4단계 분석 → Supabase 저장."""
+    return rx.cond(
+        State.selected_count > 0,
+        rx.vstack(
+            rx.divider(),
+            rx.heading("📄 PDB Article Analysis", size="4"),
+            rx.text(
+                "선택한 PDB " + State.selected_count.to_string()
+                + "개의 논문 PDF 를 업로드해 분석합니다 (수동 업로드).",
+                color_scheme="gray",
+            ),
+            rx.upload(
+                rx.vstack(rx.icon("upload"), rx.text("PDF 끌어다 놓기 또는 클릭"), align="center"),
+                id="pdf_up",
+                accept={"application/pdf": [".pdf"]},
+                max_files=1,
+                border="1px dashed var(--gray-7)",
+                padding="1rem", width="340px", border_radius="8px",
+            ),
+            rx.button(
+                "이 PDF 업로드",
+                on_click=State.handle_pdf_upload(rx.upload_files(upload_id="pdf_up")),
+            ),
+            rx.cond(
+                State.uploaded_name != "",
+                rx.text("업로드됨: " + State.uploaded_name, color_scheme="green"),
+            ),
+            rx.button("🔬 분석 시작", on_click=State.run_article_analysis, disabled=State.analyzing),
+            rx.cond(
+                State.analyzing,
+                rx.hstack(rx.spinner(), rx.text(State.analyze_status), spacing="2"),
+            ),
+            rx.cond(
+                (~State.analyzing) & (State.analyze_status != ""),
+                rx.text(State.analyze_status),
+            ),
+            rx.cond(
+                State.analyze_result_md != "",
+                rx.box(
+                    rx.markdown(State.analyze_result_md),
+                    border="1px solid var(--gray-5)", border_radius="8px",
+                    padding="1rem", width="100%", max_height="500px", overflow="auto",
+                ),
+            ),
+            spacing="2", align="start", width="100%",
+        ),
     )
 
 
@@ -212,6 +331,7 @@ def builder_content() -> rx.Component:
                 rx.text("Sequence length: " + State.seq_length.to_string() + " aa"),
                 rx.heading("PDB 구조 " + State.structure_count.to_string() + "개", size="4"),
                 _structures_grid(),
+                _article_analysis_panel(),
                 spacing="2", width="100%", align="start",
             ),
         ),
