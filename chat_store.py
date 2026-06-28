@@ -1,44 +1,24 @@
 # chat_store.py
-# AI 질의 대화 기록을 chat_history.json에 저장·조회·삭제합니다.
+# AI 질의 대화 기록을 Supabase chats 테이블에 저장·조회·삭제합니다.
+# (구) chat_history.json 파일 저장 대체. UNIFIED_MIGRATION_PLAN.md §7.
 #
 # 핵심 설계:
-#   - 각 대화는 related_uniprot_ids (list[str]) 로 복수의 단백질에 연결됩니다.
+#   - 각 대화는 related_uniprot_ids (list[str]) 로 복수의 단백질에 연결됩니다 (JSONB).
 #   - 관련 단백질은 질문 + 답변 + SQL 텍스트에서 gene_name / protein_name을 매칭하여 자동 추출합니다.
 #   - 사이드바에서는 현재 선택된 단백질이 related_uniprot_ids 에 포함된 기록만 표시합니다.
-#   - 구버전 기록(단일 uniprot_id 필드)도 하위 호환됩니다.
 
 from __future__ import annotations
 
 import json
 import re
-import uuid
-from datetime import datetime
-from pathlib import Path
 
-CHAT_HISTORY_PATH = Path(__file__).parent / "chat_history.json"
+from sqlalchemy import text
 
-
-# ─────────────────────────────────────────────
-# 내부 I/O
-# ─────────────────────────────────────────────
-def _load_raw() -> list[dict]:
-    if not CHAT_HISTORY_PATH.exists():
-        return []
-    try:
-        return json.loads(CHAT_HISTORY_PATH.read_text(encoding="utf-8"))
-    except Exception:
-        return []
-
-
-def _save_raw(records: list[dict]) -> None:
-    CHAT_HISTORY_PATH.write_text(
-        json.dumps(records, ensure_ascii=False, indent=2, default=str),
-        encoding="utf-8",
-    )
+from db_config import get_engine
 
 
 # ─────────────────────────────────────────────
-# 단백질 키워드 분석
+# 단백질 키워드 분석 (순수 로직 — 변경 없음)
 # ─────────────────────────────────────────────
 def extract_related_proteins(
     question: str,
@@ -56,7 +36,6 @@ def extract_related_proteins(
     Returns:
         관련 단백질 uniprot_id 리스트 (일치 없으면 빈 리스트)
     """
-    # 검색 대상 텍스트: 질문 + LLM 답변 + 실행된 모든 SQL
     sql_text = " ".join(q.get("sql", "") for q in result.get("queries", []))
     answer_text = result.get("answer", "")
     corpus = (question + " " + answer_text + " " + sql_text).lower()
@@ -69,7 +48,6 @@ def extract_related_proteins(
         if not uid or uid in seen:
             continue
 
-        # 검색 후보: gene_name 우선, protein_name 보조
         candidates = []
         gene = (p.get("gene_name") or "").strip()
         pname = (p.get("protein_name") or "").strip()
@@ -91,28 +69,41 @@ def extract_related_proteins(
 
 
 # ─────────────────────────────────────────────
+# 내부: DB row → app 호환 record dict
+# ─────────────────────────────────────────────
+def _row_to_record(r) -> dict:
+    created = r["created_at"]
+    return {
+        "id":                  r["id"],
+        "timestamp":           created.isoformat() if created else "",
+        "related_uniprot_ids": r["related_uniprot_ids"] or [],
+        "question":            r["question"],
+        "queries":             r["queries"] or [],
+        "answer":              r["answer"],
+        "error":               r["error"],
+    }
+
+
+# ─────────────────────────────────────────────
 # 공개 API
 # ─────────────────────────────────────────────
 def load_history(uniprot_id: str | None = None) -> list[dict]:
     """
     대화 기록을 최신순으로 반환합니다.
     uniprot_id 지정 시 related_uniprot_ids 에 해당 ID가 포함된 기록만 반환합니다.
-    구버전 기록(단일 uniprot_id 필드)도 호환합니다.
     """
-    records = _load_raw()
     if uniprot_id:
-        filtered = []
-        for r in records:
-            if "related_uniprot_ids" in r:
-                # 신버전: 리스트에 포함 여부 확인
-                if uniprot_id in r["related_uniprot_ids"]:
-                    filtered.append(r)
-            elif r.get("uniprot_id") == uniprot_id:
-                # 구버전: 단일 필드 호환
-                filtered.append(r)
-        records = filtered
-
-    return sorted(records, key=lambda r: r.get("timestamp", ""), reverse=True)
+        sql = text(
+            "SELECT * FROM chats WHERE related_uniprot_ids @> CAST(:one AS JSONB) "
+            "ORDER BY created_at DESC"
+        )
+        params = {"one": json.dumps([uniprot_id])}
+    else:
+        sql = text("SELECT * FROM chats ORDER BY created_at DESC")
+        params = {}
+    with get_engine().connect() as conn:
+        rows = conn.execute(sql, params).mappings().all()
+    return [_row_to_record(r) for r in rows]
 
 
 def save_chat(
@@ -126,42 +117,51 @@ def save_chat(
     Args:
         related_uniprot_ids: 이 질의와 관련된 단백질 uniprot_id 목록
         question:            사용자 질문 원문
-        result:              query_db_with_llm 반환값
+        result:              query_db_with_llm 반환값 (queries, answer, error)
     """
-    records = _load_raw()
-    record = {
-        "id":                  str(uuid.uuid4()),
-        "timestamp":           datetime.now().isoformat(),
+    params = {
+        "question": question,
+        "answer":   result.get("answer", ""),
+        "queries":  json.dumps(result.get("queries", []), ensure_ascii=False, default=str),
+        "error":    result.get("error"),
+        "related":  json.dumps(related_uniprot_ids, ensure_ascii=False),
+    }
+    with get_engine().begin() as conn:
+        row = conn.execute(text("""
+            INSERT INTO chats (question, answer, queries, error, related_uniprot_ids)
+            VALUES (:question, :answer, CAST(:queries AS JSONB), :error, CAST(:related AS JSONB))
+            RETURNING id, created_at
+        """), params).mappings().first()
+    return {
+        "id":                  row["id"],
+        "timestamp":           row["created_at"].isoformat(),
         "related_uniprot_ids": related_uniprot_ids,
         "question":            question,
         "queries":             result.get("queries", []),
         "answer":              result.get("answer", ""),
         "error":               result.get("error"),
     }
-    records.append(record)
-    _save_raw(records)
-    return record
 
 
-def get_chat(chat_id: str) -> dict | None:
+def get_chat(chat_id) -> dict | None:
     """ID로 특정 대화 기록을 조회합니다."""
-    for r in _load_raw():
-        if r.get("id") == chat_id:
-            return r
-    return None
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT * FROM chats WHERE id = :id"), {"id": int(chat_id)}
+        ).mappings().first()
+    return _row_to_record(row) if row else None
 
 
-def delete_chat(chat_id: str) -> None:
+def delete_chat(chat_id) -> None:
     """ID로 특정 대화 기록을 삭제합니다."""
-    records = [r for r in _load_raw() if r.get("id") != chat_id]
-    _save_raw(records)
+    with get_engine().begin() as conn:
+        conn.execute(text("DELETE FROM chats WHERE id = :id"), {"id": int(chat_id)})
 
 
-def update_chat_tags(chat_id: str, related_uniprot_ids: list[str]) -> None:
+def update_chat_tags(chat_id, related_uniprot_ids: list[str]) -> None:
     """특정 채팅 기록의 related_uniprot_ids를 업데이트합니다."""
-    records = _load_raw()
-    for r in records:
-        if r.get("id") == chat_id:
-            r["related_uniprot_ids"] = related_uniprot_ids
-            break
-    _save_raw(records)
+    with get_engine().begin() as conn:
+        conn.execute(
+            text("UPDATE chats SET related_uniprot_ids = CAST(:r AS JSONB) WHERE id = :id"),
+            {"r": json.dumps(related_uniprot_ids), "id": int(chat_id)},
+        )
