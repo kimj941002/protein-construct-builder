@@ -7,17 +7,17 @@ from __future__ import annotations
 import json
 import os
 import time
-import sqlite3
 
 import anthropic
+from sqlalchemy import text
 
-from config import DB_PATH
+from db_config import get_engine
 
 # ─────────────────────────────────────────────
 # DB 스키마 설명 (시스템 프롬프트용)
 # ─────────────────────────────────────────────
 _SCHEMA = """
-SQLite 데이터베이스 스키마 (단백질 구조 데이터):
+PostgreSQL 데이터베이스 스키마 (단백질 구조 데이터):
 
 1. proteins(uniprot_id TEXT PK, gene_name, protein_name, organism, sequence_length INTEGER,
            function_desc, subcellular_location, signal_peptide)
@@ -75,8 +75,9 @@ SQLite 데이터베이스 스키마 (단백질 구조 데이터):
 """
 
 _SYSTEM_PROMPT = f"""당신은 단백질 구조 데이터베이스 전문 AI 어시스턴트입니다.
-사용자 질문에 답하기 위해 run_sql 도구로 SQLite 데이터베이스를 조회하세요.
+사용자 질문에 답하기 위해 run_sql 도구로 PostgreSQL 데이터베이스를 조회하세요.
 필요하면 여러 번 조회해도 됩니다. SELECT(또는 WITH) 쿼리만 허용됩니다.
+표준 PostgreSQL 문법을 사용하세요 (예: ILIKE, 문자열 결합 ||, LIMIT).
 조회 결과를 바탕으로 구조생물학적으로 의미 있는 한국어 답변을 작성하세요.
 데이터에 없는 내용은 추측하지 말고 "DB에 해당 데이터가 없습니다"라고 명시하세요.
 
@@ -86,7 +87,7 @@ _TOOLS = [
     {
         "name": "run_sql",
         "description": (
-            "SQLite DB에서 SELECT(또는 WITH) 쿼리를 실행합니다. "
+            "PostgreSQL DB에서 SELECT(또는 WITH) 쿼리를 실행합니다. "
             "결과는 최대 500행으로 제한됩니다. "
             "대용량 결과가 예상되면 LIMIT절을 사용하세요."
         ),
@@ -95,7 +96,7 @@ _TOOLS = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "실행할 SQLite SELECT 쿼리 (SELECT 또는 WITH로 시작해야 함)",
+                    "description": "실행할 PostgreSQL SELECT 쿼리 (SELECT 또는 WITH로 시작해야 함)",
                 }
             },
             "required": ["query"],
@@ -121,10 +122,16 @@ def execute_sql(sql: str) -> tuple[list[dict], str | None]:
     if not (upper.startswith("SELECT") or upper.startswith("WITH")):
         return [], "보안 정책: SELECT 또는 WITH 쿼리만 허용됩니다."
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        rows = [dict(r) for r in conn.execute(stripped).fetchall()]
-        conn.close()
+        # 읽기전용 트랜잭션 + 드라이버 직접 실행:
+        #  - postgresql_readonly: CTE 내부 DML 등도 DB 차원에서 차단 (방어 심화)
+        #  - exec_driver_sql: Claude 생성 SQL의 '::' 캐스트 등을 SQLAlchemy 바인드로 오해 안 함
+        conn = get_engine().connect().execution_options(postgresql_readonly=True)
+        try:
+            with conn.begin():
+                result = conn.exec_driver_sql(stripped)
+                rows = [dict(r) for r in result.mappings().all()]
+        finally:
+            conn.close()
         return rows, None
     except Exception as exc:
         return [], str(exc)
@@ -174,7 +181,7 @@ def query_db_with_llm(
         for attempt in range(3):
             try:
                 response = client.messages.create(
-                    model="claude-opus-4-6",
+                    model="claude-opus-4-8",
                     max_tokens=16384,
                     system=_SYSTEM_PROMPT,
                     tools=_TOOLS,

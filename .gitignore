@@ -1,6 +1,6 @@
-# 데이터베이스 — protein_data.db는 GitHub 배포 전략상 추적 대상
-# (로컬에서 데이터 수집 후 GitHub에 푸시 → Streamlit Cloud에서 읽기 전용 사용)
-# protein_data.db  ← 주석 처리: GitHub에 올려야 함
+# 데이터베이스 — 단일 진실의 원천은 Supabase(Postgres). (UNIFIED_MIGRATION_PLAN.md)
+# protein_data.db 는 Supabase 이전 완료 후 추적 제외 (로컬 원본 백업으로만 보관).
+protein_data.db
 
 # API 캐시 파일
 protein_api_cache.sqlite

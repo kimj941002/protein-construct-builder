@@ -6,7 +6,6 @@ from __future__ import annotations
 import base64
 import io
 import os
-import subprocess
 from datetime import datetime
 
 import anthropic
@@ -29,7 +28,6 @@ from database import (
     get_protein,
     get_structures_by_uniprot,
     load_last_selected_protein,
-    migrate_database,
     save_last_selected_protein,
     upsert_paper_analysis,
 )
@@ -45,61 +43,9 @@ from uniprot_fetcher import fetch_protein, load_sequence_from_file, normalize_ge
 from utils import api_call_with_retry, create_cached_session
 
 # ─────────────────────────────────────────────
-# 앱 시작 시 DB 마이그레이션
+# 데이터 영속화: Supabase(Postgres). 스키마는 supabase_schema.sql 로 관리.
+# (구) SQLite + git push 방식은 폐기됨 — 데이터는 저장 즉시 Supabase 에 영속.
 # ─────────────────────────────────────────────
-migrate_database()
-
-
-# ─────────────────────────────────────────────
-# DB 자동 GitHub 저장
-# ─────────────────────────────────────────────
-def _git_push_db(gene_name: str, label: str = "") -> bool:
-    """
-    protein_data.db와 sequences/ 변경분을 origin/main에 commit & push합니다.
-    반환값: True(성공) / False(변경없음 또는 실패)
-    """
-    base = os.path.dirname(os.path.abspath(__file__))
-    try:
-        # 브랜치가 main이 아니면 main으로 전환
-        cur_branch = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=base, check=True, capture_output=True, text=True,
-        ).stdout.strip()
-
-        if cur_branch != "main":
-            subprocess.run(["git", "fetch", "origin", "main"],
-                           cwd=base, check=True, capture_output=True)
-            subprocess.run(["git", "checkout", "main"],
-                           cwd=base, check=True, capture_output=True)
-            subprocess.run(["git", "pull", "origin", "main"],
-                           cwd=base, check=True, capture_output=True)
-
-        # DB·시퀀스 스테이징
-        subprocess.run(["git", "add", "protein_data.db", "sequences/"],
-                       cwd=base, check=True, capture_output=True)
-
-        # 변경 없으면 생략
-        diff = subprocess.run(["git", "diff", "--cached", "--quiet"],
-                              cwd=base, capture_output=True)
-        if diff.returncode == 0:
-            return False
-
-        # commit 메시지 구성
-        msg = f"data: {gene_name} {label}자동 저장".strip()
-        subprocess.run(["git", "commit", "-m", msg],
-                       cwd=base, check=True, capture_output=True)
-        subprocess.run(["git", "push", "origin", "main"],
-                       cwd=base, check=True, capture_output=True)
-
-        print(f"[OK] GitHub origin/main 저장 완료: {msg}")
-        return True
-
-    except subprocess.CalledProcessError as e:
-        stderr = (e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes)
-                  else str(e.stderr or e))
-        print(f"[WARN] GitHub 저장 실패 ({gene_name}): {stderr}")
-        st.warning(f"⚠️ GitHub 저장 실패: {stderr[:200]}")
-        return False
 
 
 # ─────────────────────────────────────────────
@@ -295,12 +241,28 @@ def build_grid_dataframe(structures: list[dict]) -> pd.DataFrame:
 # ─────────────────────────────────────────────
 def build_grid_options(df: pd.DataFrame):
     # PDB ID 셀에 RCSB 링크 렌더러 (함수 기반 — 호환성 우수)
+    # 클래스형 cellRenderer 컴포넌트 — AG Grid 가 init/getGui 로 DOM 을 직접 관리한다.
+    # (st-aggrid 1.x 는 함수형 렌더러의 '문자열' 반환을 텍스트로 이스케이프하고,
+    #  'DOM 객체' 반환은 React 자식으로 넘겨 #31 에러가 난다. 클래스 컴포넌트는 둘 다 회피.)
     pdb_link_renderer = JsCode("""
-        function(params) {
-            return '<a href="https://www.rcsb.org/structure/' + params.value
-                + '" target="_blank" style="color:#1a73e8;text-decoration:none;font-weight:bold;">'
-                + params.value + '</a>';
-        }
+        (function() {
+            class PdbLinkRenderer {
+                init(params) {
+                    this.eGui = document.createElement('a');
+                    if (params.value != null) {
+                        this.eGui.href = 'https://www.rcsb.org/structure/' + params.value;
+                        this.eGui.target = '_blank';
+                        this.eGui.textContent = params.value;
+                        this.eGui.style.color = '#1a73e8';
+                        this.eGui.style.textDecoration = 'none';
+                        this.eGui.style.fontWeight = 'bold';
+                    }
+                }
+                getGui() { return this.eGui; }
+                refresh(params) { return false; }
+            }
+            return PdbLinkRenderer;
+        }())
     """)
 
     # Method / Complex — 인라인 드롭다운 floatingFilter (Community 버전)
@@ -338,8 +300,7 @@ def build_grid_options(df: pd.DataFrame):
                                 params.api.onFilterChanged();
                             }}
                         }});
-                    }});
-                }}
+                    }}
                 getGui() {{ return this.eGui; }}
                 onParentModelChanged(model) {{
                     this.eGui.value = (model && model.filter) ? model.filter : '';
@@ -656,10 +617,7 @@ if search_clicked and query.strip():
     c3.metric("Sequence Len", f"{protein_data['sequence_length']} aa")
     c4.metric("PDB 구조 수",  f"{len(pdb_ids)}개")
 
-    # ── 조기 저장: UniProt 수집 직후 즉시 GitHub push ──────────
-    # PDB 수집 도중 reboot 돼도 단백질 기본 정보는 보존됨
-    with st.spinner("단백질 정보 GitHub 저장 중..."):
-        _git_push_db(protein_data["gene_name"], label="기본정보 ")
+    # 단백질 기본 정보는 위 저장 단계에서 이미 Supabase 에 영속됨 (별도 push 불필요).
 
     with st.expander("아미노산 서열 보기"):
         seq = load_sequence_from_file(protein_data.get("sequence_path", ""))
@@ -737,11 +695,8 @@ if search_clicked and query.strip():
     st.session_state.pop("ai_selected_chat_id", None)
     save_last_selected_protein(protein_data["uniprot_id"])
 
-    # ── 최종 저장: 전체 파이프라인 완료 후 GitHub push ──────────
-    with st.spinner("전체 데이터 GitHub 최종 저장 중..."):
-        pushed = _git_push_db(protein_data["gene_name"], label="전체 수집 완료 ")
-    if pushed:
-        st.success(f"✅ {protein_data['gene_name']} 데이터가 GitHub에 저장되었습니다.")
+    # 전체 파이프라인 데이터는 각 저장 단계에서 이미 Supabase 에 영속됨.
+    st.success(f"✅ {protein_data['gene_name']} 데이터가 Supabase에 저장되었습니다.")
     st.rerun()
 
 

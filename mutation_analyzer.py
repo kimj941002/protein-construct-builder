@@ -4,7 +4,6 @@
 # WT(UniProt) 서열과 PDB 서열을 비교하여 차이를 찾습니다.
 
 from __future__ import annotations
-import json
 import os
 import requests
 from config import SIFTS_API, RCSB_POLYMER_ENTITY_API
@@ -369,16 +368,12 @@ if __name__ == "__main__":
     session = create_cached_session()
     analyze_all_structures(TARGET_UNIPROT, session)
 
-    # DB 결과 확인
-    import sqlite3
-    conn = sqlite3.connect("protein_data.db")
-    cursor = conn.cursor()
+    # DB 결과 확인 (Supabase — structure_mutations 테이블)
+    from database import get_structures_by_uniprot, get_mutations_by_structure
     print()
     print("[DB 결과]")
-    cursor.execute(
-        "SELECT structure_id, mutations FROM pdb_structures WHERE mutations IS NOT NULL"
-    )
-    for row in cursor.fetchall():
-        muts = json.loads(row[1]) if row[1] else []
-        print(f"  {row[0]}: {muts}")
-    conn.close()
+    for struct in get_structures_by_uniprot(TARGET_UNIPROT):
+        sid = struct["structure_id"]
+        muts = [m["mutation"] for m in get_mutations_by_structure(sid)]
+        if muts:
+            print(f"  {sid}: {muts}")
