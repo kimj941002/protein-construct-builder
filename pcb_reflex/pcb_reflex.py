@@ -23,6 +23,7 @@ from database import (
     get_mutations_bulk,
 )
 from collect import collect_protein
+import knowledge as K
 
 
 # ═══════════════════════════════════════════
@@ -47,6 +48,20 @@ class State(rx.State):
     analyzing: bool = False
     analyze_status: str = ""
     analyze_result_md: str = ""
+
+    # Phase 3 — Knowledge Base
+    kb_topics: list[dict] = []
+    kb_new_topic_name: str = ""
+    kb_selected_topic_id: int = 0
+    kb_selected_topic_name: str = ""
+    kb_links: list[dict] = []
+    kb_insights: list[dict] = []
+    kb_link_type: str = "structure"
+    kb_link_id: str = ""
+    kb_search_query: str = ""
+    kb_search_results: list[dict] = []
+    kb_busy: bool = False
+    kb_status: str = ""
 
     @rx.var
     def structure_count(self) -> int:
@@ -207,6 +222,92 @@ class State(rx.State):
             else:
                 self.analyze_status = "분석 완료 — Supabase(papers) 저장됨"
                 self.analyze_result_md = res["output_md"]
+
+    # ── Phase 3: Knowledge Base ──
+    @rx.event
+    def set_kb_new_topic_name(self, v: str):
+        self.kb_new_topic_name = v
+
+    @rx.event
+    def set_kb_link_type(self, v: str):
+        self.kb_link_type = v
+
+    @rx.event
+    def set_kb_link_id(self, v: str):
+        self.kb_link_id = v
+
+    @rx.event
+    def set_kb_search_query(self, v: str):
+        self.kb_search_query = v
+
+    @rx.event
+    def kb_load_topics(self):
+        self.kb_topics = K.list_topics()
+
+    @rx.event
+    def kb_create_topic(self):
+        name = self.kb_new_topic_name.strip()
+        if not name:
+            return
+        K.create_topic(name)
+        self.kb_new_topic_name = ""
+        self.kb_topics = K.list_topics()
+
+    @rx.event
+    def kb_select_topic(self, topic_id: int, name: str):
+        self.kb_selected_topic_id = topic_id
+        self.kb_selected_topic_name = name
+        self.kb_links = K.get_links(topic_id)
+        self.kb_insights = K.list_insights(topic_id)
+
+    @rx.event
+    def kb_add_link(self):
+        if not self.kb_selected_topic_id or not self.kb_link_id.strip():
+            return
+        K.add_link(self.kb_selected_topic_id, self.kb_link_type, self.kb_link_id.strip())
+        self.kb_link_id = ""
+        self.kb_links = K.get_links(self.kb_selected_topic_id)
+
+    @rx.event(background=True)
+    async def kb_synthesize(self):
+        async with self:
+            if not self.kb_selected_topic_id:
+                return
+            self.kb_busy = True
+            self.kb_status = "LLM 종합 인사이트 생성 중... (수십 초)"
+            tid = self.kb_selected_topic_id
+        res = await asyncio.to_thread(K.synthesize_topic, tid)
+        async with self:
+            self.kb_busy = False
+            if res.get("error"):
+                self.kb_status = "오류: " + res["error"]
+            else:
+                self.kb_status = "종합 완료 — insight 저장·임베딩됨"
+                self.kb_insights = K.list_insights(tid)
+
+    @rx.event(background=True)
+    async def kb_reindex(self):
+        async with self:
+            self.kb_busy = True
+            self.kb_status = "기존 논문/분석 임베딩(재색인) 중..."
+        n = await asyncio.to_thread(K.reindex_papers)
+        async with self:
+            self.kb_busy = False
+            self.kb_status = f"재색인 완료: {n}건 임베딩됨"
+
+    @rx.event(background=True)
+    async def kb_search(self):
+        q = self.kb_search_query.strip()
+        if not q:
+            return
+        async with self:
+            self.kb_busy = True
+            self.kb_status = "의미검색 중..."
+        results = await asyncio.to_thread(K.semantic_search, q, 8)
+        async with self:
+            self.kb_busy = False
+            self.kb_status = ""
+            self.kb_search_results = results
 
 
 # ═══════════════════════════════════════════
@@ -431,8 +532,104 @@ def analyzer_page() -> rx.Component:
     return layout(analyzer_content())
 
 
+def _search_result(r: dict) -> rx.Component:
+    return rx.box(
+        rx.hstack(
+            rx.badge(r["source_type"]),
+            rx.text(r["source_id"], weight="bold"),
+            rx.spacer(),
+            rx.text(r["score"]),
+            width="100%",
+        ),
+        rx.text(r["chunk_text"], size="2", color_scheme="gray"),
+        border="1px solid var(--gray-4)", border_radius="6px",
+        padding="0.5rem", width="100%",
+    )
+
+
+def _topic_item(t: dict) -> rx.Component:
+    return rx.button(
+        t["name"],
+        on_click=State.kb_select_topic(t["id"], t["name"]),
+        variant="soft", width="100%",
+    )
+
+
+def _link_item(l: dict) -> rx.Component:
+    return rx.text("• ", l["entity_type"], ": ", l["entity_id"], size="2")
+
+
+def _insight_item(ins: dict) -> rx.Component:
+    return rx.box(
+        rx.heading(ins["title"], size="3"),
+        rx.markdown(ins["body"]),
+        border="1px solid var(--gray-5)", border_radius="8px",
+        padding="0.75rem", width="100%",
+    )
+
+
+def _topic_detail() -> rx.Component:
+    return rx.cond(
+        State.kb_selected_topic_id != 0,
+        rx.vstack(
+            rx.heading("📌 " + State.kb_selected_topic_name, size="4"),
+            rx.hstack(
+                rx.select(
+                    ["protein", "structure", "paper"],
+                    value=State.kb_link_type, on_change=State.set_kb_link_type,
+                ),
+                rx.input(
+                    value=State.kb_link_id, on_change=State.set_kb_link_id,
+                    placeholder="ID (예: P08581 / 3CCN)", width="220px",
+                ),
+                rx.button("연결 추가", on_click=State.kb_add_link),
+            ),
+            rx.text("연결된 항목:", weight="bold"),
+            rx.vstack(rx.foreach(State.kb_links, _link_item), spacing="1", align="start"),
+            rx.button("🧠 종합 인사이트 생성", on_click=State.kb_synthesize, disabled=State.kb_busy),
+            rx.heading("인사이트", size="5"),
+            rx.vstack(rx.foreach(State.kb_insights, _insight_item), spacing="2", width="100%"),
+            spacing="2", align="start", flex="1",
+        ),
+    )
+
+
+def knowledge_content() -> rx.Component:
+    return rx.vstack(
+        rx.heading("Knowledge Base", size="7"),
+        rx.text("주제로 단백질·구조·논문을 묶고, LLM 종합 인사이트와 의미검색으로 지식을 누적합니다.",
+                color_scheme="gray"),
+        rx.heading("🔎 의미검색", size="4"),
+        rx.hstack(
+            rx.input(value=State.kb_search_query, on_change=State.set_kb_search_query,
+                     placeholder="예: MET DFG-out 저해제", width="360px"),
+            rx.button("검색", on_click=State.kb_search),
+            rx.button("재색인", on_click=State.kb_reindex, variant="outline"),
+        ),
+        rx.cond(State.kb_busy, rx.hstack(rx.spinner(), rx.text(State.kb_status), spacing="2")),
+        rx.cond((~State.kb_busy) & (State.kb_status != ""),
+                rx.text(State.kb_status, color_scheme="gray")),
+        rx.vstack(rx.foreach(State.kb_search_results, _search_result), width="100%", spacing="1"),
+        rx.divider(),
+        rx.heading("🧠 주제(Topic)", size="4"),
+        rx.hstack(
+            rx.input(value=State.kb_new_topic_name, on_change=State.set_kb_new_topic_name,
+                     placeholder="새 주제 이름", width="280px"),
+            rx.button("주제 생성", on_click=State.kb_create_topic),
+        ),
+        rx.hstack(
+            rx.vstack(rx.foreach(State.kb_topics, _topic_item),
+                      width="240px", spacing="1", align="start"),
+            _topic_detail(),
+            align="start", spacing="4", width="100%",
+        ),
+        spacing="3", align="start", width="100%",
+        on_mount=State.kb_load_topics,
+    )
+
+
 def knowledge_page() -> rx.Component:
-    return _placeholder("Knowledge Base", "준비 중 — Phase 3 에서 구현합니다 (주제 기반 + 의미검색).")
+    return layout(knowledge_content())
 
 
 app = rx.App()
