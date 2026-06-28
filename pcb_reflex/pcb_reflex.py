@@ -1,10 +1,11 @@
 """
-Protein Construct Builder — Reflex 앱 (Stage 3 핵심 뷰)
-======================================================
-UNIFIED_MIGRATION_PLAN.md §6. Streamlit 과 같은 Supabase + 같은 서비스 계층 위에서
-동작하는 단백질/구조 조회 뷰. DB 접근은 database.py 의 서비스 함수만 호출한다
-(rx.Model 로 스키마를 재정의하지 않음 — 서비스 계층이 단일 DB 진입점).
+Protein Construct Builder — 통합 Reflex 앱
+==========================================
+UNIFIED_MIGRATION_PLAN.md / REFLEX_UNIFIED_PLAN.md.
+좌측 사이드바로 Construct Builder / Paper Analyzer / Knowledge Base 를 오간다.
+DB 접근은 database.py·collect.py 의 서비스 함수만 호출(스키마 재정의 없음).
 """
+import asyncio
 import os
 import sys
 
@@ -21,46 +22,34 @@ from database import (
     get_structures_by_uniprot,
     get_mutations_bulk,
 )
+from collect import collect_protein
 
 
+# ═══════════════════════════════════════════
+# State
+# ═══════════════════════════════════════════
 class State(rx.State):
-    """단백질/구조 조회 상태."""
+    query: str = ""
+    collecting: bool = False
+    collect_status: str = ""
+    not_found: bool = False
 
-    proteins: list[dict] = []
     selected_uid: str = ""
     gene_name: str = ""
     organism: str = ""
     seq_length: int = 0
     structures: list[dict] = []
-    selected_structure_ids: list[str] = []   # AG Grid 다중선택 결과 (Phase 2 논문분석용)
-
-    @rx.var
-    def protein_uids(self) -> list[str]:
-        return [str(p.get("uniprot_id", "")) for p in self.proteins]
+    selected_structure_ids: list[str] = []
 
     @rx.var
     def structure_count(self) -> int:
         return len(self.structures)
 
-    @rx.event
-    def load_proteins(self):
-        """페이지 진입 시 수집된 단백질 목록 로드 (서비스 계층)."""
-        self.proteins = get_all_proteins()
-
-    @rx.event
-    def on_select_structures(self, rows: list[dict]):
-        """AG Grid 다중선택 → 선택된 structure_id 보관 (Phase 2 PDB 논문분석)."""
-        self.selected_structure_ids = [
-            r.get("structure_id") for r in rows if r.get("structure_id")
-        ]
-
-    @rx.event
-    def select_protein(self, uid: str):
-        """단백질 선택 → 헤더 + 구조 목록(+ mutation) 로드."""
-        if not uid:
-            return
-        self.selected_uid = uid
+    # ── 내부 헬퍼 (동기) ──
+    def _apply_protein(self, uid: str):
+        """헤더 + 구조 표를 State 에 적재 (async with self 안에서 호출)."""
         p = get_protein(uid) or {}
+        self.selected_uid = uid
         self.gene_name = p.get("gene_name") or ""
         self.organism = p.get("organism") or ""
         self.seq_length = p.get("sequence_length") or 0
@@ -70,13 +59,58 @@ class State(rx.State):
         for s in structs:
             muts = mut_map.get(s["structure_id"], [])
             s["mutations_str"] = "; ".join(m["mutation"] for m in muts) if muts else "-"
-            s["resolution_str"] = "" if s.get("resolution") is None else str(s["resolution"])
-            # href 는 State 에서 미리 문자열로 만든다 (컴포넌트 Var 레이어에서 "str"+item 불가)
             s["rcsb_url"] = "https://www.rcsb.org/structure/" + str(s["structure_id"])
         self.structures = structs
 
+    def _resolve_or_collect(self, q: str) -> str | None:
+        """DB 우선(UniProt ID/gene 매칭) → 없으면 신규 수집. uid 반환(실패 None). (스레드 실행)"""
+        p = get_protein(q.upper())
+        if p:
+            return p["uniprot_id"]
+        for pr in get_all_proteins():
+            if (pr.get("gene_name") or "").upper() == q.upper():
+                return pr["uniprot_id"]
+        res = collect_protein(q)
+        if res.get("error"):
+            return None
+        return res["uniprot_id"]
 
-# AG Grid 컬럼 정의 — 기존 Streamlit 구조 표와 동일 구성 (정렬/필터)
+    # ── 이벤트 ──
+    @rx.event
+    def set_query(self, value: str):
+        self.query = value
+
+    @rx.event(background=True)
+    async def search(self):
+        q = self.query.strip()
+        if not q:
+            return
+        async with self:
+            self.collecting = True
+            self.not_found = False
+            self.collect_status = f"'{q}' 조회/수집 중... (새 단백질은 수 분 소요)"
+            self.selected_uid = ""
+            self.structures = []
+            self.selected_structure_ids = []
+        uid = await asyncio.to_thread(self._resolve_or_collect, q)
+        async with self:
+            self.collecting = False
+            self.collect_status = ""
+            if uid:
+                self._apply_protein(uid)
+            else:
+                self.not_found = True
+
+    @rx.event
+    def on_select_structures(self, rows: list[dict]):
+        self.selected_structure_ids = [
+            r.get("structure_id") for r in rows if r.get("structure_id")
+        ]
+
+
+# ═══════════════════════════════════════════
+# AG Grid 컬럼
+# ═══════════════════════════════════════════
 _COLUMN_DEFS = [
     {"field": "structure_id", "headerName": "PDB ID", "pinned": "left", "filter": True,
      "checkboxSelection": True, "headerCheckboxSelection": True, "minWidth": 120},
@@ -95,7 +129,6 @@ _COLUMN_DEFS = [
 
 
 def _structures_grid() -> rx.Component:
-    """AG Grid 구조 표 (자체 래퍼) — 정렬·필터·다중선택. 테마 클래스+높이는 래퍼 div 에."""
     return rx.box(
         ag_grid(
             column_defs=_COLUMN_DEFS,
@@ -111,47 +144,104 @@ def _structures_grid() -> rx.Component:
     )
 
 
-def index() -> rx.Component:
-    return rx.container(
-        rx.vstack(
-            rx.heading("🧬 Protein Construct Builder — Reflex", size="7"),
-            rx.text(
-                "Supabase 위에서 동작하는 단백질/구조 조회 (Stage 3 핵심 뷰). "
-                "Streamlit 앱과 같은 데이터·서비스 계층을 공유합니다.",
-                color_scheme="gray",
-            ),
-            rx.select(
-                State.protein_uids,
-                placeholder="단백질 선택 (UniProt ID)",
-                on_change=State.select_protein,
-                width="320px",
-            ),
-            rx.cond(
-                State.selected_uid != "",
-                rx.vstack(
-                    rx.heading(
-                        State.gene_name + " (" + State.selected_uid + ")", size="5"
-                    ),
-                    rx.text("Organism: " + State.organism),
-                    rx.text("Sequence length: " + State.seq_length.to_string() + " aa"),
-                    rx.heading(
-                        "PDB 구조 " + State.structure_count.to_string() + "개", size="4"
-                    ),
-                    _structures_grid(),
-                    spacing="2",
-                    width="100%",
-                    align="start",
-                ),
-            ),
-            spacing="4",
-            align="start",
-            width="100%",
-        ),
-        on_mount=State.load_proteins,
-        size="4",
-        padding="2rem",
+# ═══════════════════════════════════════════
+# 레이아웃 (사이드바)
+# ═══════════════════════════════════════════
+def _nav_link(label: str, href: str) -> rx.Component:
+    return rx.link(
+        label, href=href,
+        width="100%", padding="0.5rem 0.75rem", border_radius="6px",
+        _hover={"background": rx.color("accent", 4)},
     )
 
 
+def sidebar() -> rx.Component:
+    return rx.vstack(
+        rx.heading("🧬 PCB", size="5", margin_bottom="0.5rem"),
+        _nav_link("🧬 Construct Builder", "/"),
+        _nav_link("🔬 Paper Analyzer", "/analyzer"),
+        _nav_link("🧠 Knowledge Base", "/knowledge"),
+        spacing="1", align="start",
+        width="220px", height="100vh", padding="1rem",
+        background=rx.color("gray", 2),
+        border_right=f"1px solid {rx.color('gray', 5)}",
+        position="sticky", top="0",
+    )
+
+
+def layout(content: rx.Component) -> rx.Component:
+    return rx.hstack(
+        sidebar(),
+        rx.box(content, padding="1.5rem", width="100%", flex="1"),
+        align="start", width="100%", spacing="0",
+    )
+
+
+# ═══════════════════════════════════════════
+# 페이지: Construct Builder
+# ═══════════════════════════════════════════
+def builder_content() -> rx.Component:
+    return rx.vstack(
+        rx.heading("Construct Builder", size="7"),
+        rx.text("단백질을 검색하면 PDB·KLIFS 정보를 수집해 표로 보여줍니다.",
+                color_scheme="gray"),
+        rx.hstack(
+            rx.input(
+                value=State.query,
+                on_change=State.set_query,
+                placeholder="단백질 검색 (예: MET, EGFR, P08581)",
+                width="320px",
+            ),
+            rx.button("🔍 검색", on_click=State.search, disabled=State.collecting),
+            spacing="2",
+        ),
+        rx.cond(
+            State.collecting,
+            rx.hstack(rx.spinner(), rx.text(State.collect_status), spacing="2"),
+        ),
+        rx.cond(
+            State.not_found,
+            rx.callout("단백질을 찾지 못했습니다. 검색어를 확인하세요.",
+                       icon="triangle_alert", color_scheme="red"),
+        ),
+        rx.cond(
+            State.selected_uid != "",
+            rx.vstack(
+                rx.heading(State.gene_name + " (" + State.selected_uid + ")", size="5"),
+                rx.text("Organism: " + State.organism),
+                rx.text("Sequence length: " + State.seq_length.to_string() + " aa"),
+                rx.heading("PDB 구조 " + State.structure_count.to_string() + "개", size="4"),
+                _structures_grid(),
+                spacing="2", width="100%", align="start",
+            ),
+        ),
+        spacing="4", align="start", width="100%",
+    )
+
+
+def index() -> rx.Component:
+    return layout(builder_content())
+
+
+def _placeholder(title: str, desc: str) -> rx.Component:
+    return layout(
+        rx.vstack(
+            rx.heading(title, size="7"),
+            rx.callout(desc, icon="info"),
+            spacing="3", align="start",
+        )
+    )
+
+
+def analyzer_page() -> rx.Component:
+    return _placeholder("Paper Analyzer", "준비 중 — Phase 2 에서 구현합니다 (PDF 업로드 → 4단계 분석).")
+
+
+def knowledge_page() -> rx.Component:
+    return _placeholder("Knowledge Base", "준비 중 — Phase 3 에서 구현합니다 (주제 기반 + 의미검색).")
+
+
 app = rx.App()
-app.add_page(index, title="PCB Reflex")
+app.add_page(index, route="/", title="Construct Builder")
+app.add_page(analyzer_page, route="/analyzer", title="Paper Analyzer")
+app.add_page(knowledge_page, route="/knowledge", title="Knowledge Base")
