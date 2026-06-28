@@ -10,11 +10,9 @@ except ImportError:
     pass  # Streamlit Cloud 등 dotenv 없는 환경에서는 os.environ / st.secrets 사용
 
 # ─────────────────────────────────────────────
-# 데이터베이스 설정
+# 데이터/파일 경로 설정
 # ─────────────────────────────────────────────
-
-# protein_data.db: 수집한 단백질/구조 데이터를 저장하는 SQLite 파일
-DB_PATH = os.path.join(os.path.dirname(__file__), "protein_data.db")
+# DB는 Supabase(Postgres) — 연결은 db_config.py 가 담당. (구 SQLite DB_PATH 제거됨)
 
 # sequences/: 아미노산 서열 FASTA 파일 저장 폴더
 SEQUENCES_DIR = os.path.join(os.path.dirname(__file__), "sequences")
