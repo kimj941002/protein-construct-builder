@@ -522,6 +522,21 @@ def get_paper_analysis(structure_id: str) -> dict | None:
     return dict(row) if row else None
 
 
+def upsert_paper_conditions(structure_id: str, conditions: dict, status: str = "completed"):
+    """PDB별 논문 구조화 분석 결과(structured JSONB)를 paper_analysis 에 저장."""
+    import json
+    with get_engine().begin() as conn:
+        conn.execute(text("""
+            INSERT INTO paper_analysis (structure_id, status, structured, analyzed_at)
+            VALUES (:sid, :st, CAST(:j AS JSONB), now())
+            ON CONFLICT (structure_id) DO UPDATE SET
+                status      = EXCLUDED.status,
+                structured  = EXCLUDED.structured,
+                analyzed_at = now()
+        """), {"sid": structure_id, "st": status,
+               "j": json.dumps(conditions, ensure_ascii=False)})
+
+
 # ─────────────────────────────────────────────
 # 직접 실행 시 스키마 적용 + 테이블 확인
 # 터미널: python database.py

@@ -9,8 +9,13 @@ import reflex as rx
 
 
 def _selected_rows(e: rx.Var):
-    """on_selection_changed → 선택 행(list[dict]) 전달 (Phase 2 다중선택용)."""
+    """on_selection_changed → 선택 행(list[dict]) 전달 (다중선택용)."""
     return [rx.Var(f"{e}.api.getSelectedRows()")]
+
+
+def _clicked_row(e: rx.Var):
+    """on_row_clicked → 클릭한 행 데이터(dict) 전달 (단일 선택 → 세부보기용)."""
+    return [rx.Var(f"{e}.data")]
 
 
 class AgGrid(rx.Component):
@@ -28,6 +33,7 @@ class AgGrid(rx.Component):
     pagination_page_size: rx.Var[int]
 
     on_selection_changed: rx.EventHandler[_selected_rows]
+    on_row_clicked: rx.EventHandler[_clicked_row]
 
     def add_imports(self):
         # v33 모듈/테마는 ag-grid-community 에서 import

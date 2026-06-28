@@ -21,9 +21,36 @@ from database import (
     get_protein,
     get_structures_by_uniprot,
     get_mutations_bulk,
+    get_domains_by_uniprot,
+    get_structure,
+    get_mutations_by_structure,
+    get_ligands_by_structure,
+    get_partners_by_structure,
+    get_all_chains_by_structure,
+    get_oligosaccharides_by_structure,
+    get_klifs_by_structure,
+    get_paper_analysis,
+    upsert_paper_conditions,
 )
+from uniprot_fetcher import load_sequence_from_file
 from collect import collect_protein
 import knowledge as K
+
+# 도메인 트랙 색상
+_DOMAIN_COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3",
+                  "#937860", "#DA8BC3", "#8C8C8C", "#CCB974", "#64B5CD"]
+
+
+def _format_sequence(seq: str) -> str:
+    """UniProt 형식: 60자/줄 + 위치 번호."""
+    if not seq:
+        return "(서열 없음)"
+    lines = []
+    for i in range(0, len(seq), 60):
+        chunk = seq[i:i + 60]
+        blocks = " ".join(chunk[j:j + 10] for j in range(0, len(chunk), 10))
+        lines.append(f"{i + 1:>6}  {blocks}")
+    return "\n".join(lines)
 
 
 def _app_password() -> str:
@@ -56,6 +83,21 @@ class State(rx.State):
     seq_length: int = 0
     structures: list[dict] = []
     selected_structure_ids: list[str] = []
+
+    # PDB database — 도메인 / 시퀀스 / 세부 패널 / 구조화 분석
+    domains: list[dict] = []
+    sequence_fmt: str = ""
+    detail_sid: str = ""
+    detail: dict = {}
+    detail_mutations: list[dict] = []
+    detail_ligands: list[dict] = []
+    detail_partners: list[dict] = []
+    detail_oligos: list[dict] = []
+    detail_klifs_str: str = ""
+    pdb_conditions: dict = {}
+    has_conditions: bool = False
+    cond_analyzing: bool = False
+    cond_status: str = ""
 
     # Phase 2 — PDB Article Analysis
     uploaded_pdf_path: str = ""
@@ -107,20 +149,74 @@ class State(rx.State):
 
     # ── 내부 헬퍼 (동기) ──
     def _apply_protein(self, uid: str):
-        """헤더 + 구조 표를 State 에 적재 (async with self 안에서 호출)."""
+        """헤더 + 도메인 + 시퀀스 + 구조 표를 State 에 적재 (async with self 안에서 호출)."""
         p = get_protein(uid) or {}
         self.selected_uid = uid
         self.gene_name = p.get("gene_name") or ""
         self.organism = p.get("organism") or ""
-        self.seq_length = p.get("sequence_length") or 0
+        seq_len = p.get("sequence_length") or 0
+        self.seq_length = seq_len
 
+        # 도메인 트랙 (위치% 미리 계산)
+        doms = get_domains_by_uniprot(uid)
+        out = []
+        for i, d in enumerate(doms):
+            start = d.get("start_pos") or 0
+            end = d.get("end_pos") or seq_len or 1
+            denom = seq_len or end or 1
+            left = max(0.0, (start - 1) / denom * 100)
+            width = max(0.8, (end - start + 1) / denom * 100)
+            nm = d.get("name") or "domain"
+            out.append({
+                "name": nm,
+                "range": f"{start}-{end}",
+                "label": f"{nm} ({start}-{end})",
+                "left": f"{left:.2f}%", "width": f"{width:.2f}%",
+                "color": _DOMAIN_COLORS[i % len(_DOMAIN_COLORS)],
+            })
+        self.domains = out
+
+        # 시퀀스 (UniProt 형식)
+        seq = load_sequence_from_file(p.get("sequence_path", "")) if p.get("sequence_path") else ""
+        self.sequence_fmt = _format_sequence(seq)
+
+        # 구조 표
         structs = get_structures_by_uniprot(uid)
         mut_map = get_mutations_bulk([s["structure_id"] for s in structs])
         for s in structs:
             muts = mut_map.get(s["structure_id"], [])
             s["mutations_str"] = "; ".join(m["mutation"] for m in muts) if muts else "-"
-            s["rcsb_url"] = "https://www.rcsb.org/structure/" + str(s["structure_id"])
         self.structures = structs
+        # 세부 패널 초기화
+        self.detail_sid = ""
+        self.detail = {}
+
+    def _load_detail(self, sid: str):
+        """클릭한 PDB 의 세부 + 기존 구조화 분석을 적재."""
+        self.detail_sid = sid
+        self.detail = get_structure(sid) or {}
+        self.detail_mutations = get_mutations_by_structure(sid)
+        self.detail_ligands = get_ligands_by_structure(sid)
+        partners = get_partners_by_structure(sid)
+        chains_map = get_all_chains_by_structure(sid)
+        for pp in partners:
+            pp["chains_str"] = ", ".join(chains_map.get(pp["id"], [])) or (pp.get("partner_chain_id") or "-")
+        self.detail_partners = partners
+        self.detail_oligos = get_oligosaccharides_by_structure(sid)
+        k = get_klifs_by_structure(sid)
+        if k and (k.get("dfg") or k.get("ac_helix")):
+            self.detail_klifs_str = f"DFG: {k.get('dfg') or '-'} / αC-helix: {k.get('ac_helix') or '-'}"
+        else:
+            self.detail_klifs_str = ""
+        # 기존 구조화 분석
+        pa = get_paper_analysis(sid)
+        if pa and pa.get("structured"):
+            self.pdb_conditions = pa["structured"]
+            self.has_conditions = True
+        else:
+            self.pdb_conditions = {}
+            self.has_conditions = False
+        self.cond_status = ""
 
     def _resolve_or_collect(self, q: str) -> str | None:
         """DB 우선(UniProt ID/gene 매칭) → 없으면 신규 수집. uid 반환(실패 None). (스레드 실행)"""
@@ -166,6 +262,41 @@ class State(rx.State):
         self.selected_structure_ids = [
             r.get("structure_id") for r in rows if r.get("structure_id")
         ]
+
+    @rx.event
+    def on_row_clicked(self, row: dict):
+        sid = row.get("structure_id")
+        if sid:
+            self._load_detail(sid)
+
+    # ── PDB별 논문 구조화 분석 (실험 세부조건) ──
+    def _do_conditions(self, pdf: str, sid: str) -> dict:
+        from paper_pipeline import extract_construct_conditions
+        r = extract_construct_conditions(pdf)
+        if r.get("error"):
+            return r
+        upsert_paper_conditions(sid, r["conditions"])
+        return {"conditions": r["conditions"]}
+
+    @rx.event(background=True)
+    async def run_pdb_conditions(self):
+        async with self:
+            if not self.uploaded_pdf_path or not self.detail_sid:
+                self.cond_status = "PDB 선택 + PDF 업로드가 필요합니다."
+                return
+            self.cond_analyzing = True
+            self.cond_status = "논문 구조화 분석 중... (수십 초~수 분)"
+            pdf = self.uploaded_pdf_path
+            sid = self.detail_sid
+        res = await asyncio.to_thread(self._do_conditions, pdf, sid)
+        async with self:
+            self.cond_analyzing = False
+            if res.get("error"):
+                self.cond_status = "오류: " + res["error"]
+            else:
+                self.cond_status = "분석 완료 — Supabase 저장됨"
+                self.pdb_conditions = res["conditions"]
+                self.has_conditions = True
 
     # ── Phase 2: 논문 업로드 + 분석 ──
     @rx.event
@@ -349,7 +480,7 @@ class State(rx.State):
 # ═══════════════════════════════════════════
 _COLUMN_DEFS = [
     {"field": "structure_id", "headerName": "PDB ID", "pinned": "left", "filter": True,
-     "checkboxSelection": True, "headerCheckboxSelection": True, "minWidth": 120},
+     "minWidth": 120},
     {"field": "method", "headerName": "Method", "filter": True},
     {"field": "resolution", "headerName": "Res (Å)", "filter": "agNumberColumnFilter", "maxWidth": 110},
     {"field": "complex_type", "headerName": "Complex", "filter": True},
@@ -370,62 +501,174 @@ def _structures_grid() -> rx.Component:
             column_defs=_COLUMN_DEFS,
             row_data=State.structures,
             default_col_def={"sortable": True, "resizable": True, "floatingFilter": True},
-            row_selection="multiple",
+            row_selection="single",
             pagination=True,
             pagination_page_size=20,
-            on_selection_changed=State.on_select_structures,
+            on_row_clicked=State.on_row_clicked,
         ),
         width="100%",
-        height="600px",
+        height="520px",
     )
 
 
-def _article_analysis_panel() -> rx.Component:
-    """선택한 PDB 의 논문 PDF 업로드 → 4단계 분석 → Supabase 저장."""
+# ── Family & Domains (UniProt feature 트랙) ──
+def _domain_seg(d: dict) -> rx.Component:
+    return rx.tooltip(
+        rx.box(position="absolute", left=d["left"], width=d["width"],
+               top="0", height="26px", background=d["color"], border_radius="4px"),
+        content=d["label"],
+    )
+
+
+def _domain_row(d: dict) -> rx.Component:
+    return rx.hstack(
+        rx.box(width="12px", height="12px", background=d["color"], border_radius="2px"),
+        rx.text(d["name"], weight="bold", size="2"),
+        rx.text(d["range"], size="2", color_scheme="gray"),
+        spacing="2", align="center",
+    )
+
+
+def _domain_track() -> rx.Component:
     return rx.cond(
-        State.selected_count > 0,
+        State.domains.length() > 0,
         rx.vstack(
-            rx.divider(),
-            rx.heading("📄 PDB Article Analysis", size="4"),
-            rx.text(
-                "선택한 PDB " + State.selected_count.to_string()
-                + "개의 논문 PDF 를 업로드해 분석합니다 (수동 업로드).",
-                color_scheme="gray",
+            rx.heading("Family & Domains", size="4"),
+            rx.box(
+                rx.foreach(State.domains, _domain_seg),
+                position="relative", width="100%", height="26px",
+                background=rx.color("gray", 4), border_radius="4px",
             ),
-            rx.upload(
-                rx.vstack(rx.icon("upload"), rx.text("PDF 끌어다 놓기 또는 클릭"), align="center"),
-                id="pdf_up",
-                accept={"application/pdf": [".pdf"]},
-                max_files=1,
-                border="1px dashed var(--gray-7)",
-                padding="1rem", width="340px", border_radius="8px",
-            ),
-            rx.button(
-                "이 PDF 업로드",
-                on_click=State.handle_pdf_upload(rx.upload_files(upload_id="pdf_up")),
-            ),
-            rx.cond(
-                State.uploaded_name != "",
-                rx.text("업로드됨: " + State.uploaded_name, color_scheme="green"),
-            ),
-            rx.button("🔬 분석 시작", on_click=State.run_article_analysis, disabled=State.analyzing),
-            rx.cond(
-                State.analyzing,
-                rx.hstack(rx.spinner(), rx.text(State.analyze_status), spacing="2"),
-            ),
-            rx.cond(
-                (~State.analyzing) & (State.analyze_status != ""),
-                rx.text(State.analyze_status),
-            ),
-            rx.cond(
-                State.analyze_result_md != "",
-                rx.box(
-                    rx.markdown(State.analyze_result_md),
-                    border="1px solid var(--gray-5)", border_radius="8px",
-                    padding="1rem", width="100%", max_height="500px", overflow="auto",
-                ),
+            rx.vstack(rx.foreach(State.domains, _domain_row), spacing="1", align="start"),
+            spacing="2", align="start", width="100%",
+        ),
+    )
+
+
+# ── Sequence (UniProt 형식) ──
+def _sequence_view() -> rx.Component:
+    return rx.cond(
+        State.sequence_fmt != "",
+        rx.vstack(
+            rx.heading("Sequence", size="4"),
+            rx.box(
+                rx.text(State.sequence_fmt, white_space="pre", font_family="monospace",
+                        font_size="0.78rem"),
+                border="1px solid var(--gray-5)", border_radius="8px", padding="0.75rem",
+                width="100%", overflow="auto", max_height="240px",
             ),
             spacing="2", align="start", width="100%",
+        ),
+    )
+
+
+# ── PDB 세부 패널 (행 클릭 시) ──
+def _kv(label: str, value) -> rx.Component:
+    return rx.box(
+        rx.text(label, size="1", color_scheme="gray"),
+        rx.text(value, size="2", weight="bold"),
+        min_width="120px",
+    )
+
+
+def _mut_item(m: dict) -> rx.Component:
+    return rx.text("• ", m["mutation"], " [", m["mutation_type"], "]", size="2")
+
+
+def _lig_item(l: dict) -> rx.Component:
+    return rx.text("• ", l["ligand_id"], "  ", l["ligand_name"], size="2")
+
+
+def _partner_item(p: dict) -> rx.Component:
+    return rx.text("• ", p["partner_gene_name"], " (", p["partner_uniprot_id"],
+                   ")  chains: ", p["chains_str"], size="2")
+
+
+def _oligo_item(o: dict) -> rx.Component:
+    return rx.text("• ", o["name"], "  @chain ", o["linked_chain"], size="2")
+
+
+def _cond_card(label: str, key: str) -> rx.Component:
+    return rx.box(
+        rx.heading(label, size="3"),
+        rx.text(State.pdb_conditions[key], white_space="pre-wrap", size="2"),
+        border="1px solid var(--gray-5)", border_radius="8px", padding="0.75rem", width="100%",
+    )
+
+
+def _pdb_detail_panel() -> rx.Component:
+    return rx.cond(
+        State.detail_sid != "",
+        rx.vstack(
+            rx.divider(),
+            rx.hstack(
+                rx.heading("🔬 " + State.detail_sid, size="4"),
+                rx.link("RCSB ↗", href="https://www.rcsb.org/structure/" + State.detail_sid,
+                        is_external=True, size="2"),
+                spacing="3", align="center",
+            ),
+            rx.flex(
+                _kv("Method", State.detail["method"]),
+                _kv("Resolution", State.detail["resolution"]),
+                _kv("Complex", State.detail["complex_type"]),
+                _kv("Chain", State.detail["chain_id"]),
+                _kv("Residue range", State.detail["residue_range"]),
+                _kv("Organism", State.detail["expression_system"]),
+                _kv("Expr system", State.detail["host_cell_line"]),
+                _kv("Space group", State.detail["space_group"]),
+                _kv("Crystal pH", State.detail["crystal_ph"]),
+                _kv("Deposit", State.detail["deposition_date"]),
+                wrap="wrap", spacing="4", width="100%",
+            ),
+            rx.cond(State.detail_klifs_str != "",
+                    rx.text("KLIFS — " + State.detail_klifs_str, size="2", color_scheme="gray")),
+            rx.cond(State.detail_mutations.length() > 0,
+                    rx.vstack(rx.text("Mutations", weight="bold", size="2"),
+                              rx.foreach(State.detail_mutations, _mut_item), spacing="0", align="start")),
+            rx.cond(State.detail_ligands.length() > 0,
+                    rx.vstack(rx.text("Ligands", weight="bold", size="2"),
+                              rx.foreach(State.detail_ligands, _lig_item), spacing="0", align="start")),
+            rx.cond(State.detail_partners.length() > 0,
+                    rx.vstack(rx.text("Partner proteins", weight="bold", size="2"),
+                              rx.foreach(State.detail_partners, _partner_item), spacing="0", align="start")),
+            rx.cond(State.detail_oligos.length() > 0,
+                    rx.vstack(rx.text("PTM / Oligosaccharides", weight="bold", size="2"),
+                              rx.foreach(State.detail_oligos, _oligo_item), spacing="0", align="start")),
+
+            # 논문 구조화 분석
+            rx.divider(),
+            rx.heading("📄 논문 실험조건 분석", size="4"),
+            rx.text("이 PDB 를 발표한 논문 PDF 를 업로드하면 주제·통찰 + 실험 세부조건을 정리합니다.",
+                    color_scheme="gray", size="2"),
+            rx.upload(
+                rx.hstack(rx.icon("upload"), rx.text("PDF 선택/끌어놓기"), align="center"),
+                id="pdf_cond", accept={"application/pdf": [".pdf"]}, max_files=1,
+                border="1px dashed var(--gray-7)", padding="0.75rem", border_radius="8px", width="320px",
+            ),
+            rx.hstack(
+                rx.button("업로드", on_click=State.handle_pdf_upload(rx.upload_files(upload_id="pdf_cond"))),
+                rx.button("🔬 구조화 분석", on_click=State.run_pdb_conditions, disabled=State.cond_analyzing),
+                spacing="2",
+            ),
+            rx.cond(State.uploaded_name != "", rx.text("업로드됨: " + State.uploaded_name,
+                                                       color_scheme="green", size="2")),
+            rx.cond(State.cond_analyzing, rx.hstack(rx.spinner(), rx.text(State.cond_status), spacing="2")),
+            rx.cond((~State.cond_analyzing) & (State.cond_status != ""),
+                    rx.text(State.cond_status, size="2")),
+            rx.cond(
+                State.has_conditions,
+                rx.vstack(
+                    _cond_card("주제", "topic"),
+                    _cond_card("핵심 통찰", "insights"),
+                    _cond_card("DNA Cloning", "cloning"),
+                    _cond_card("단백질 발현", "expression"),
+                    _cond_card("단백질 정제", "purification"),
+                    _cond_card("결정화", "crystallization"),
+                    _cond_card("활성·분석 어세이", "assay"),
+                    spacing="2", width="100%",
+                ),
+            ),
+            spacing="3", align="start", width="100%",
         ),
     )
 
@@ -443,9 +686,9 @@ def _nav_link(label: str, href: str) -> rx.Component:
 
 def sidebar() -> rx.Component:
     return rx.vstack(
-        rx.heading("🧬 PCB", size="5", margin_bottom="0.5rem"),
-        _nav_link("🧬 Construct Builder", "/"),
-        _nav_link("🔬 Paper Analyzer", "/analyzer"),
+        rx.heading("🧬 Structure research", size="5", margin_bottom="0.5rem"),
+        _nav_link("🗄️ PDB database", "/"),
+        _nav_link("🤖 Custom LLM", "/analyzer"),
         _nav_link("🧠 Knowledge Base", "/knowledge"),
         spacing="1", align="start",
         width="220px", height="100vh", padding="1rem",
@@ -458,7 +701,7 @@ def sidebar() -> rx.Component:
 def _login_view() -> rx.Component:
     return rx.center(
         rx.vstack(
-            rx.heading("🔒 Protein Construct Builder", size="6"),
+            rx.heading("🔒 Structure research", size="6"),
             rx.text("접속하려면 공유 비밀번호를 입력하세요.", color_scheme="gray"),
             rx.input(
                 value=State.password_input, on_change=State.set_password_input,
@@ -487,44 +730,56 @@ def layout(content: rx.Component) -> rx.Component:
 # ═══════════════════════════════════════════
 # 페이지: Construct Builder
 # ═══════════════════════════════════════════
-def builder_content() -> rx.Component:
-    return rx.vstack(
-        rx.heading("Construct Builder", size="7"),
-        rx.text("단백질을 검색하면 PDB·KLIFS 정보를 수집해 표로 보여줍니다.",
-                color_scheme="gray"),
-        rx.hstack(
-            rx.input(
-                value=State.query,
-                on_change=State.set_query,
-                placeholder="단백질 검색 (예: MET, EGFR, P08581)",
-                width="320px",
+def _center_search() -> rx.Component:
+    """단백질 미선택 시 — UniProt 홈처럼 가운데 큰 검색창."""
+    return rx.center(
+        rx.vstack(
+            rx.heading("PDB database", size="8"),
+            rx.text("UniProt 단백질을 검색하면 PDB·KLIFS 정보를 수집해 보여줍니다.",
+                    color_scheme="gray"),
+            rx.hstack(
+                rx.input(value=State.query, on_change=State.set_query,
+                         placeholder="단백질 검색 (예: MET, EGFR, P08581)",
+                         width="440px", size="3"),
+                rx.button("🔍 검색", on_click=State.search, disabled=State.collecting, size="3"),
+                spacing="2",
             ),
-            rx.button("🔍 검색", on_click=State.search, disabled=State.collecting),
+            rx.cond(State.collecting,
+                    rx.hstack(rx.spinner(), rx.text(State.collect_status), spacing="2")),
+            rx.cond(State.not_found,
+                    rx.callout("단백질을 찾지 못했습니다. 검색어를 확인하세요.",
+                               icon="triangle_alert", color_scheme="red")),
+            spacing="4", align="center",
+        ),
+        min_height="72vh", width="100%",
+    )
+
+
+def _results_view() -> rx.Component:
+    return rx.vstack(
+        rx.hstack(
+            rx.input(value=State.query, on_change=State.set_query,
+                     placeholder="단백질 검색", width="300px"),
+            rx.button("검색", on_click=State.search, disabled=State.collecting),
+            rx.cond(State.collecting, rx.spinner()),
             spacing="2",
         ),
-        rx.cond(
-            State.collecting,
-            rx.hstack(rx.spinner(), rx.text(State.collect_status), spacing="2"),
-        ),
-        rx.cond(
-            State.not_found,
-            rx.callout("단백질을 찾지 못했습니다. 검색어를 확인하세요.",
-                       icon="triangle_alert", color_scheme="red"),
-        ),
-        rx.cond(
-            State.selected_uid != "",
-            rx.vstack(
-                rx.heading(State.gene_name + " (" + State.selected_uid + ")", size="5"),
-                rx.text("Organism: " + State.organism),
-                rx.text("Sequence length: " + State.seq_length.to_string() + " aa"),
-                rx.heading("PDB 구조 " + State.structure_count.to_string() + "개", size="4"),
-                _structures_grid(),
-                _article_analysis_panel(),
-                spacing="2", width="100%", align="start",
-            ),
-        ),
-        spacing="4", align="start", width="100%",
+        rx.heading(State.gene_name + " (" + State.selected_uid + ")", size="6"),
+        rx.text("Organism: " + State.organism + " · Length: "
+                + State.seq_length.to_string() + " aa", color_scheme="gray"),
+        _domain_track(),
+        _sequence_view(),
+        rx.heading("PDB 구조 " + State.structure_count.to_string() + "개", size="4"),
+        rx.text("표에서 PDB 행을 클릭하면 아래에 세부정보가 나타납니다.",
+                color_scheme="gray", size="2"),
+        _structures_grid(),
+        _pdb_detail_panel(),
+        spacing="3", align="start", width="100%",
     )
+
+
+def builder_content() -> rx.Component:
+    return rx.cond(State.selected_uid != "", _results_view(), _center_search())
 
 
 def index() -> rx.Component:
@@ -688,6 +943,6 @@ def knowledge_page() -> rx.Component:
 
 
 app = rx.App()
-app.add_page(index, route="/", title="Construct Builder")
-app.add_page(analyzer_page, route="/analyzer", title="Paper Analyzer")
+app.add_page(index, route="/", title="PDB database")
+app.add_page(analyzer_page, route="/analyzer", title="Custom LLM")
 app.add_page(knowledge_page, route="/knowledge", title="Knowledge Base")
