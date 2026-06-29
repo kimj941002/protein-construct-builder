@@ -32,6 +32,8 @@ from database import (
     get_klifs_bulk,
     get_paper_analysis,
     upsert_paper_conditions,
+    save_paper_pdf,
+    get_paper_pdf,
 )
 from uniprot_fetcher import load_sequence_from_file
 from collect import collect_protein
@@ -123,6 +125,7 @@ class State(rx.State):
     # 업로드 진행 표시
     uploading: bool = False
     upload_progress: int = 0
+    has_pdf: bool = False   # 현재 PDB 에 저장된 PDF 있는지
 
     # Phase 3 — Knowledge Base
     kb_topics: list[dict] = []
@@ -251,6 +254,13 @@ class State(rx.State):
         else:
             self.pdb_conditions = {}
             self.has_conditions = False
+        # 업로드 상태 초기화 + 이 PDB 에 저장된 PDF 반영 (PDB 바꾸면 이전 파일명 사라짐)
+        stored_name = (pa or {}).get("pdf_name") or ""
+        self.uploaded_name = stored_name
+        self.has_pdf = bool(stored_name)
+        self.uploaded_pdf_path = ""
+        self.uploading = False
+        self.upload_progress = 0
         self.cond_status = ""
 
     def _resolve_or_collect(self, q: str) -> str | None:
@@ -307,6 +317,15 @@ class State(rx.State):
     # ── PDB별 논문 구조화 분석 (실험 세부조건) ──
     def _do_conditions(self, pdf: str, sid: str) -> dict:
         from paper_pipeline import extract_construct_conditions
+        # 임시 경로 없으면 DB 에 저장된 PDF 바이트로 임시파일 생성
+        if not pdf:
+            data, _ = get_paper_pdf(sid)
+            if not data:
+                return {"error": "저장된 PDF가 없습니다."}
+            import tempfile
+            fd, pdf = tempfile.mkstemp(suffix=".pdf")
+            with os.fdopen(fd, "wb") as o:
+                o.write(data)
         r = extract_construct_conditions(pdf)
         if r.get("error"):
             return r
@@ -316,8 +335,8 @@ class State(rx.State):
     @rx.event(background=True)
     async def run_pdb_conditions(self):
         async with self:
-            if not self.uploaded_pdf_path or not self.detail_sid:
-                self.cond_status = "PDB 선택 + PDF 업로드가 필요합니다."
+            if not self.detail_sid or (not self.uploaded_pdf_path and not self.has_pdf):
+                self.cond_status = "논문 PDF 를 먼저 업로드하세요."
                 return
             self.cond_analyzing = True
             self.cond_status = "논문 구조화 분석 중... (수십 초~수 분)"
@@ -352,7 +371,15 @@ class State(rx.State):
         with os.fdopen(fd, "wb") as out:
             out.write(data)
         self.uploaded_pdf_path = path
-        self.uploaded_name = getattr(f, "name", None) or getattr(f, "filename", "") or "uploaded.pdf"
+        name = getattr(f, "name", None) or getattr(f, "filename", "") or "uploaded.pdf"
+        self.uploaded_name = name
+        # 현재 PDB 에 PDF 원본 저장(누적) → 나중에 새 창으로 열람 가능
+        if self.detail_sid:
+            try:
+                save_paper_pdf(self.detail_sid, data, name)
+                self.has_pdf = True
+            except Exception:
+                pass
         self.analyze_result_md = ""
         self.analyze_status = ""
         self.cond_status = ""
@@ -775,10 +802,19 @@ def _pdb_detail_panel() -> rx.Component:
             rx.text("이 PDB 를 발표한 논문 PDF 를 업로드하면 주제·통찰 + 실험 세부조건을 정리합니다.",
                     color_scheme="gray", size="2"),
             rx.upload(
-                rx.vstack(
-                    rx.icon("file-up", size=26),
-                    rx.text("여기를 클릭해 논문 PDF 선택 (선택 즉시 업로드)", size="2"),
-                    align="center", spacing="1",
+                rx.cond(
+                    State.uploaded_name != "",
+                    rx.vstack(
+                        rx.icon("file-text", size=24),
+                        rx.text("📄 " + State.uploaded_name, size="2", weight="bold"),
+                        rx.text("다른 PDF 로 교체하려면 클릭/드롭", size="1", color_scheme="gray"),
+                        align="center", spacing="1",
+                    ),
+                    rx.vstack(
+                        rx.icon("file-up", size=26),
+                        rx.text("여기를 클릭해 논문 PDF 선택 (선택 즉시 업로드)", size="2"),
+                        align="center", spacing="1",
+                    ),
                 ),
                 id="pdf_cond", accept={"application/pdf": [".pdf"]}, max_files=1,
                 on_drop=State.handle_pdf_upload(
@@ -786,16 +822,20 @@ def _pdb_detail_panel() -> rx.Component:
                                     on_upload_progress=State.on_upload_progress)
                 ),
                 border="2px dashed var(--accent-8)", padding="1.1rem",
-                border_radius="10px", width="360px", cursor="pointer",
+                border_radius="24px", width="360px", cursor="pointer",
             ),
             rx.cond(State.uploading,
                     rx.hstack(rx.spinner(),
                               rx.text("업로드 중... " + State.upload_progress.to_string() + "%"),
                               spacing="2")),
-            rx.cond(State.uploaded_name != "",
-                    rx.text("✅ 업로드됨: " + State.uploaded_name, color_scheme="green", size="2")),
+            rx.cond(
+                State.has_pdf,
+                rx.link("🔗 이 PDB 의 논문 PDF 새 창에서 열기",
+                        href="/pdf/" + State.detail_sid, is_external=True,
+                        size="2", weight="bold"),
+            ),
             rx.button("🔬 구조화 분석", on_click=State.run_pdb_conditions,
-                      disabled=State.cond_analyzing | (State.uploaded_name == "")),
+                      disabled=State.cond_analyzing | (~State.has_pdf)),
             rx.cond(State.cond_analyzing, rx.hstack(rx.spinner(), rx.text(State.cond_status), spacing="2")),
             rx.cond((~State.cond_analyzing) & (State.cond_status != ""),
                     rx.text(State.cond_status, size="2")),
@@ -1138,6 +1178,25 @@ def knowledge_page() -> rx.Component:
     return layout(knowledge_content())
 
 
+# ── 백엔드 라우트: 저장된 PDB 논문 PDF 를 새 창에서 열기 (/pdf/{sid}) ──
+from starlette.applications import Starlette
+from starlette.routing import Route
+from starlette.responses import Response
+
+
+async def _serve_pdf(request):
+    sid = request.path_params.get("sid", "")
+    data, name = get_paper_pdf(sid)
+    if not data:
+        return Response("PDF not found", status_code=404)
+    return Response(
+        content=data, media_type="application/pdf",
+        headers={"Content-Disposition": f'inline; filename="{name or (sid + ".pdf")}"'},
+    )
+
+
+_pdf_api = Starlette(routes=[Route("/pdf/{sid}", _serve_pdf)])
+
 app = rx.App(
     theme=rx.theme(
         appearance="dark",
@@ -1147,6 +1206,7 @@ app = rx.App(
         scaling="100%",
     ),
     stylesheets=["styles.css"],
+    api_transformer=_pdf_api,
 )
 app.add_page(index, route="/", title="PDB database")
 app.add_page(analyzer_page, route="/analyzer", title="Custom LLM")

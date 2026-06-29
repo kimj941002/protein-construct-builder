@@ -141,6 +141,8 @@ CREATE TABLE IF NOT EXISTS paper_analysis (
     status       TEXT DEFAULT 'none',
     raw_text     TEXT,
     structured   JSONB,   -- PDB별 논문 구조화 분석(주제/통찰/클로닝/발현/정제/결정화/어세이)
+    pdf_bytes    BYTEA,   -- 업로드한 논문 PDF 원본(누적)
+    pdf_name     TEXT,
     analyzed_at  TIMESTAMPTZ
 );
 

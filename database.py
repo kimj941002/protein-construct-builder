@@ -514,12 +514,38 @@ def upsert_paper_analysis(data: dict):
 
 
 def get_paper_analysis(structure_id: str) -> dict | None:
+    # pdf_bytes(대용량)는 제외하고 조회
     with get_engine().connect() as conn:
         row = conn.execute(
-            text("SELECT * FROM paper_analysis WHERE structure_id = :sid"),
+            text("SELECT structure_id, status, raw_text, structured, analyzed_at, pdf_name "
+                 "FROM paper_analysis WHERE structure_id = :sid"),
             {"sid": structure_id},
         ).mappings().first()
     return dict(row) if row else None
+
+
+def save_paper_pdf(structure_id: str, pdf_bytes: bytes, pdf_name: str):
+    """PDB별 논문 PDF 원본을 paper_analysis 에 저장(누적)."""
+    with get_engine().begin() as conn:
+        conn.execute(text("""
+            INSERT INTO paper_analysis (structure_id, pdf_bytes, pdf_name, status)
+            VALUES (:sid, :b, :n, COALESCE((SELECT status FROM paper_analysis WHERE structure_id=:sid), 'uploaded'))
+            ON CONFLICT (structure_id) DO UPDATE SET
+                pdf_bytes = EXCLUDED.pdf_bytes,
+                pdf_name  = EXCLUDED.pdf_name
+        """), {"sid": structure_id, "b": pdf_bytes, "n": pdf_name})
+
+
+def get_paper_pdf(structure_id: str) -> tuple[bytes | None, str | None]:
+    """저장된 PDF 원본(바이트, 파일명) 반환."""
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT pdf_bytes, pdf_name FROM paper_analysis WHERE structure_id = :sid"),
+            {"sid": structure_id},
+        ).first()
+    if not row or row[0] is None:
+        return None, None
+    return bytes(row[0]), row[1]
 
 
 def upsert_paper_conditions(structure_id: str, conditions: dict, status: str = "completed"):
