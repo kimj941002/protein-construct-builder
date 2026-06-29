@@ -70,6 +70,22 @@ def _inhibitor_type(dfg, ac) -> str:
     return "-"
 
 
+def _materialize_pdf(sid: str, data: bytes | None = None) -> None:
+    """PDF 바이트를 업로드 디렉토리에 {sid}.pdf 로 써서 /_upload 로 서빙되게 한다.
+    (Reflex 내장 /_upload 경로는 로컬·Reflex Cloud 모두에서 백엔드로 라우팅됨)."""
+    import pathlib
+    updir = pathlib.Path(rx.get_upload_dir())
+    fpath = updir / f"{sid}.pdf"
+    if data is None:
+        if fpath.exists():
+            return
+        data, _ = get_paper_pdf(sid)
+        if not data:
+            return
+    updir.mkdir(parents=True, exist_ok=True)
+    fpath.write_bytes(data)
+
+
 def _app_password() -> str:
     """공유 접속 비밀번호 (secrets/env 의 APP_PASSWORD). 미설정이면 게이트 비활성(로컬 개발)."""
     try:
@@ -258,6 +274,11 @@ class State(rx.State):
         stored_name = (pa or {}).get("pdf_name") or ""
         self.uploaded_name = stored_name
         self.has_pdf = bool(stored_name)
+        if self.has_pdf:
+            try:
+                _materialize_pdf(sid)  # 업로드 디렉토리에 없으면 1회만 적재
+            except Exception:
+                pass
         self.uploaded_pdf_path = ""
         self.uploading = False
         self.upload_progress = 0
@@ -373,16 +394,20 @@ class State(rx.State):
         self.uploaded_pdf_path = path
         name = getattr(f, "name", None) or getattr(f, "filename", "") or "uploaded.pdf"
         self.uploaded_name = name
-        # 현재 PDB 에 PDF 원본 저장(누적) → 나중에 새 창으로 열람 가능
+        # 현재 PDB 에 PDF 원본 저장(누적, 덮어쓰기) + 업로드 디렉토리에 서빙용 파일
         if self.detail_sid:
             try:
                 save_paper_pdf(self.detail_sid, data, name)
+                _materialize_pdf(self.detail_sid, data)
                 self.has_pdf = True
+                # 새 PDF 로 교체 → 이전 구조화 분석 결과 비우고 재분석 유도
+                self.pdb_conditions = {}
+                self.has_conditions = False
             except Exception:
                 pass
         self.analyze_result_md = ""
         self.analyze_status = ""
-        self.cond_status = ""
+        self.cond_status = "새 PDF 업로드 완료 — '구조화 분석'을 눌러 새로 분석하세요."
         self.uploading = False
         self.upload_progress = 100
 
@@ -831,8 +856,8 @@ def _pdb_detail_panel() -> rx.Component:
             rx.cond(
                 State.has_pdf,
                 rx.link("🔗 이 PDB 의 논문 PDF 새 창에서 열기",
-                        href="/pdf/" + State.detail_sid, is_external=True,
-                        size="2", weight="bold"),
+                        href=rx.get_upload_url(State.detail_sid + ".pdf"),
+                        is_external=True, size="2", weight="bold"),
             ),
             rx.button("🔬 구조화 분석", on_click=State.run_pdb_conditions,
                       disabled=State.cond_analyzing | (~State.has_pdf)),
@@ -1178,25 +1203,6 @@ def knowledge_page() -> rx.Component:
     return layout(knowledge_content())
 
 
-# ── 백엔드 라우트: 저장된 PDB 논문 PDF 를 새 창에서 열기 (/pdf/{sid}) ──
-from starlette.applications import Starlette
-from starlette.routing import Route
-from starlette.responses import Response
-
-
-async def _serve_pdf(request):
-    sid = request.path_params.get("sid", "")
-    data, name = get_paper_pdf(sid)
-    if not data:
-        return Response("PDF not found", status_code=404)
-    return Response(
-        content=data, media_type="application/pdf",
-        headers={"Content-Disposition": f'inline; filename="{name or (sid + ".pdf")}"'},
-    )
-
-
-_pdf_api = Starlette(routes=[Route("/pdf/{sid}", _serve_pdf)])
-
 app = rx.App(
     theme=rx.theme(
         appearance="dark",
@@ -1206,7 +1212,6 @@ app = rx.App(
         scaling="100%",
     ),
     stylesheets=["styles.css"],
-    api_transformer=_pdf_api,
 )
 app.add_page(index, route="/", title="PDB database")
 app.add_page(analyzer_page, route="/analyzer", title="Custom LLM")
