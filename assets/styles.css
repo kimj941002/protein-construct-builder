@@ -1,0 +1,56 @@
+/* Pretendard (Light 300 / Medium 500 / Bold 700) */
+@import url("https://cdn.jsdelivr.net/gh/orioncactus/pretendard@v1.3.9/dist/web/variable/pretendardvariable-dynamic-subset.css");
+
+:root,
+.radix-themes {
+  /* 폰트 */
+  --default-font-family: "Pretendard Variable", Pretendard, -apple-system, BlinkMacSystemFont, sans-serif;
+  --heading-font-family: "Pretendard Variable", Pretendard, sans-serif;
+
+  /* 프라이머리 = LightCoral #F08080 (Radix accent 덮어쓰기) */
+  --accent-1:  #1b1416;
+  --accent-2:  #221a1c;
+  --accent-3:  #33242a;
+  --accent-4:  #432d33;
+  --accent-5:  #53383d;
+  --accent-6:  #6a474c;
+  --accent-7:  #8a5a5e;
+  --accent-8:  #b06f71;
+  --accent-9:  #F08080;
+  --accent-10: #e96d6d;
+  --accent-11: #f3a0a0;
+  --accent-12: #ffd9d9;
+  --accent-a9: rgba(240, 128, 128, 0.9);
+  --accent-a10: rgba(233, 109, 109, 0.95);
+  --accent-contrast: #21151a;
+
+  /* 다크 배경 */
+  --color-background: #141118;
+}
+
+/* 폰트 볼륨: 라이트 기본, 강조 미디움, 제목 볼드 (3개만) */
+body { background: #141118; font-family: var(--default-font-family); font-weight: 300; }
+.radix-themes { font-weight: 300; }
+h1, h2, h3, h4, h5, h6,
+.rt-Heading { font-weight: 700 !important; }
+strong, b, .rt-Strong, .rt-Text[data-weight="bold"] { font-weight: 500 !important; }
+button, .rt-Button, .rt-BaseButton { font-weight: 500 !important; }
+
+/* 라디우스 24px 통일 (박스/카드/버튼/입력/콜아웃 등) */
+.rt-Card,
+.rt-BaseButton, .rt-Button,
+.rt-TextFieldRoot, .rt-TextAreaRoot,
+.rt-SelectTrigger,
+.rt-Callout,
+.rt-BaseCard,
+.rt-AccordionItem,
+.rx-Upload,
+[data-radius] { border-radius: 24px !important; }
+
+/* 미니멀: 스크롤바 얇게, 경계 은은하게 */
+::-webkit-scrollbar { width: 8px; height: 8px; }
+::-webkit-scrollbar-thumb { background: #3a3340; border-radius: 24px; }
+::-webkit-scrollbar-track { background: transparent; }
+
+/* 사이드바/패널 표면 톤 */
+.app-surface { background: #1b1720; border: 1px solid #2a2530; border-radius: 24px; }

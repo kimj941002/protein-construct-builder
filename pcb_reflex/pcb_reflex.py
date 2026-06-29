@@ -621,6 +621,7 @@ def _structures_grid() -> rx.Component:
         ),
         width="100%",
         height="520px",
+        custom_attrs={"data-ag-theme-mode": "dark"},  # AG Grid v33 다크 테마
     )
 
 
@@ -646,15 +647,15 @@ def _domain_track() -> rx.Component:
     return rx.cond(
         State.domains.length() > 0,
         rx.vstack(
-            rx.heading("Family & Domains", size="4"),
             rx.box(
                 rx.foreach(State.domains, _domain_seg),
                 position="relative", width="100%", height="26px",
-                background=rx.color("gray", 4), border_radius="4px",
+                background=rx.color("gray", 4), border_radius="13px",
             ),
             rx.vstack(rx.foreach(State.domains, _domain_row), spacing="1", align="start"),
             spacing="2", align="start", width="100%",
         ),
+        rx.text("도메인 정보 없음", color_scheme="gray", size="2"),
     )
 
 
@@ -662,16 +663,13 @@ def _domain_track() -> rx.Component:
 def _sequence_view() -> rx.Component:
     return rx.cond(
         State.sequence_fmt != "",
-        rx.vstack(
-            rx.heading("Sequence", size="4"),
-            rx.box(
-                rx.text(State.sequence_fmt, white_space="pre", font_family="monospace",
-                        font_size="0.78rem"),
-                border="1px solid var(--gray-5)", border_radius="8px", padding="0.75rem",
-                width="100%", overflow="auto", max_height="240px",
-            ),
-            spacing="2", align="start", width="100%",
+        rx.box(
+            rx.text(State.sequence_fmt, white_space="pre", font_family="monospace",
+                    font_size="0.78rem"),
+            border="1px solid var(--gray-5)", border_radius="24px", padding="0.9rem",
+            width="100%", overflow="auto", max_height="240px",
         ),
+        rx.text("서열 없음", color_scheme="gray", size="2"),
     )
 
 
@@ -878,6 +876,15 @@ def _center_search() -> rx.Component:
     )
 
 
+def _section(title, body, value: str) -> rx.Component:
+    """접기/펴기 가능한 섹션 (아코디언 아이템)."""
+    return rx.accordion.item(
+        header=title,
+        content=rx.box(body, padding="0.6rem 0.25rem"),
+        value=value,
+    )
+
+
 def _results_view() -> rx.Component:
     return rx.vstack(
         rx.hstack(
@@ -890,13 +897,24 @@ def _results_view() -> rx.Component:
         rx.heading(State.gene_name + " (" + State.selected_uid + ")", size="6"),
         rx.text("Organism: " + State.organism + " · Length: "
                 + State.seq_length.to_string() + " aa", color_scheme="gray"),
-        _domain_track(),
-        _sequence_view(),
-        rx.heading("PDB 구조 " + State.structure_count.to_string() + "개", size="4"),
-        rx.text("표에서 PDB 행을 클릭하면 아래에 세부정보가 나타납니다.",
-                color_scheme="gray", size="2"),
-        _structures_grid(),
-        _pdb_detail_panel(),
+        rx.accordion.root(
+            _section("Family & Domains", _domain_track(), "dom"),
+            _section("Sequence", _sequence_view(), "seq"),
+            _section(
+                "PDB 구조 " + State.structure_count.to_string() + "개",
+                rx.vstack(
+                    rx.text("표에서 PDB 행을 클릭하면 아래에 세부정보가 나타납니다.",
+                            color_scheme="gray", size="2"),
+                    _structures_grid(),
+                    _pdb_detail_panel(),
+                    spacing="2", width="100%", align="start",
+                ),
+                "pdb",
+            ),
+            type="multiple",
+            default_value=["dom", "seq", "pdb"],
+            width="100%", variant="surface", radius="large",
+        ),
         spacing="3", align="start", width="100%",
     )
 
@@ -1097,7 +1115,16 @@ def knowledge_page() -> rx.Component:
     return layout(knowledge_content())
 
 
-app = rx.App()
+app = rx.App(
+    theme=rx.theme(
+        appearance="dark",
+        accent_color="tomato",   # CSS 로 LightCoral 로 덮어씀
+        gray_color="mauve",
+        radius="large",
+        scaling="100%",
+    ),
+    stylesheets=["styles.css"],
+)
 app.add_page(index, route="/", title="PDB database")
 app.add_page(analyzer_page, route="/analyzer", title="Custom LLM")
 app.add_page(knowledge_page, route="/knowledge", title="Knowledge Base")
