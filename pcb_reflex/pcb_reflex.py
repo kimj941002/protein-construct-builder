@@ -29,6 +29,7 @@ from database import (
     get_all_chains_by_structure,
     get_oligosaccharides_by_structure,
     get_klifs_by_structure,
+    get_klifs_bulk,
     get_paper_analysis,
     upsert_paper_conditions,
 )
@@ -52,6 +53,19 @@ def _format_sequence(seq: str) -> str:
         blocks = " ".join(chunk[j:j + 10] for j in range(0, len(chunk), 10))
         lines.append(f"{i + 1:>6}  {blocks}")
     return "\n".join(lines)
+
+
+def _inhibitor_type(dfg, ac) -> str:
+    """KLIFS DFG/αC 형태로 저해제 타입 추정 (휴리스틱)."""
+    d = (dfg or "").lower()
+    a = (ac or "").lower()
+    if d == "out":
+        return "Type II"
+    if d == "in" and a == "out":
+        return "Type I½"
+    if d == "in" and a == "in":
+        return "Type I"
+    return "-"
 
 
 def _app_password() -> str:
@@ -195,12 +209,18 @@ class State(rx.State):
         seq = load_sequence_from_file(p.get("sequence_path", "")) if p.get("sequence_path") else ""
         self.sequence_fmt = _format_sequence(seq)
 
-        # 구조 표
+        # 구조 표 (+ KLIFS: DFG/αC/추정 타입)
         structs = get_structures_by_uniprot(uid)
-        mut_map = get_mutations_bulk([s["structure_id"] for s in structs])
+        sids = [s["structure_id"] for s in structs]
+        mut_map = get_mutations_bulk(sids)
+        klifs_map = get_klifs_bulk(sids)
         for s in structs:
             muts = mut_map.get(s["structure_id"], [])
             s["mutations_str"] = "; ".join(m["mutation"] for m in muts) if muts else "-"
+            k = klifs_map.get(s["structure_id"]) or {}
+            s["dfg"] = k.get("dfg") or "-"
+            s["ac_helix"] = k.get("ac_helix") or "-"
+            s["inhibitor_type"] = _inhibitor_type(k.get("dfg"), k.get("ac_helix"))
         self.structures = structs
         # 세부 패널 초기화
         self.detail_sid = ""
@@ -597,6 +617,9 @@ _COLUMN_DEFS = [
     {"field": "method", "headerName": "Method", "filter": True},
     {"field": "resolution", "headerName": "Res (Å)", "filter": "agNumberColumnFilter", "maxWidth": 110},
     {"field": "complex_type", "headerName": "Complex", "filter": True},
+    {"field": "inhibitor_type", "headerName": "Inhibitor type", "filter": True, "maxWidth": 130},
+    {"field": "dfg", "headerName": "DFG", "filter": True, "maxWidth": 90},
+    {"field": "ac_helix", "headerName": "αC-helix", "filter": True, "maxWidth": 100},
     {"field": "chain_id", "headerName": "Chain", "filter": True, "maxWidth": 100},
     {"field": "residue_range", "headerName": "Residue Range", "filter": True},
     {"field": "mutations_str", "headerName": "Mutations", "filter": True},
@@ -1118,8 +1141,8 @@ def knowledge_page() -> rx.Component:
 app = rx.App(
     theme=rx.theme(
         appearance="dark",
-        accent_color="tomato",   # CSS 로 LightCoral 로 덮어씀
-        gray_color="mauve",
+        accent_color="gray",     # 무채색(중성) — CSS 로 톤 보정
+        gray_color="slate",
         radius="large",
         scaling="100%",
     ),
