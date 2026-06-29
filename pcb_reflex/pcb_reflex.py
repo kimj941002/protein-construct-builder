@@ -394,19 +394,40 @@ class State(rx.State):
         self.uploaded_pdf_path = path
         name = getattr(f, "name", None) or getattr(f, "filename", "") or "uploaded.pdf"
         self.uploaded_name = name
-        # 현재 PDB 에 PDF 원본 저장(누적, 덮어쓰기) + 업로드 디렉토리에 서빙용 파일
-        if self.detail_sid:
-            try:
-                save_paper_pdf(self.detail_sid, data, name)
-                _materialize_pdf(self.detail_sid, data)
-                self.has_pdf = True
-                # 새 PDF 로 교체 → 이전 구조화 분석 결과 비우고 재분석 유도
-                self.pdb_conditions = {}
-                self.has_conditions = False
-            except Exception:
-                pass
         self.analyze_result_md = ""
         self.analyze_status = ""
+
+        if not self.detail_sid:
+            self.cond_status = "먼저 PDB 행을 선택한 뒤 PDF 를 올려주세요."
+            self.uploading = False
+            self.upload_progress = 0
+            return
+        if not data:
+            self.cond_status = "PDF 내용을 읽지 못했습니다(빈 파일)."
+            self.uploading = False
+            self.upload_progress = 0
+            return
+
+        # 1) DB 에 원본 저장(누적, 덮어쓰기) — 이게 성공하면 업로드 성공으로 간주
+        try:
+            save_paper_pdf(self.detail_sid, data, name)
+        except Exception as ex:
+            self.has_pdf = False
+            self.cond_status = f"PDF 저장 실패: {type(ex).__name__}: {str(ex)[:160]}"
+            self.uploading = False
+            self.upload_progress = 0
+            return
+        self.has_pdf = True
+        # 새 PDF 로 교체 → 이전 구조화 분석 결과 비우고 재분석 유도
+        self.pdb_conditions = {}
+        self.has_conditions = False
+
+        # 2) 새 창 열람용 서빙 파일 적재(실패해도 비치명적 — 열 때 DB 에서 재생성)
+        try:
+            _materialize_pdf(self.detail_sid, data)
+        except Exception:
+            pass
+
         self.cond_status = "새 PDF 업로드 완료 — '구조화 분석'을 눌러 새로 분석하세요."
         self.uploading = False
         self.upload_progress = 100
