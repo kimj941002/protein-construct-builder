@@ -58,7 +58,12 @@ def _format_sequence(seq: str) -> str:
 
 
 def _inhibitor_type(dfg, ac) -> str:
-    """KLIFS DFG/αC 형태로 저해제 타입 추정 (휴리스틱)."""
+    """KLIFS DFG/αC 입체구조로부터 저해제 타입을 **추정**하는 휴리스틱.
+
+    DFG/αC 값의 출처는 KLIFS(klifs.net) — 표준 키나아제 입체구조 분류 DB.
+    이 함수가 내는 Type 은 리간드 실험분류가 아니라 **수용체 입체구조 기반 추정**이다.
+    근거·검증은 DATA_PROVENANCE.md §2 참조.
+    """
     d = (dfg or "").lower()
     a = (ac or "").lower()
     if d == "out":
@@ -690,9 +695,12 @@ _COLUMN_DEFS = [
     {"field": "method", "headerName": "Method", "filter": True},
     {"field": "resolution", "headerName": "Res (Å)", "filter": "agNumberColumnFilter", "maxWidth": 110},
     {"field": "complex_type", "headerName": "Complex", "filter": True},
-    {"field": "inhibitor_type", "headerName": "Inhibitor type", "filter": True, "maxWidth": 130},
-    {"field": "dfg", "headerName": "DFG", "filter": True, "maxWidth": 90},
-    {"field": "ac_helix", "headerName": "αC-helix", "filter": True, "maxWidth": 100},
+    {"field": "inhibitor_type", "headerName": "Inhibitor type", "filter": True, "maxWidth": 130,
+     "headerTooltip": "KLIFS DFG/αC 입체구조 기반 추정 (실험 분류 아님). 출처·근거: DATA_PROVENANCE.md §2"},
+    {"field": "dfg", "headerName": "DFG", "filter": True, "maxWidth": 90,
+     "headerTooltip": "KLIFS (klifs.net) DFG motif in/out"},
+    {"field": "ac_helix", "headerName": "αC-helix", "filter": True, "maxWidth": 100,
+     "headerTooltip": "KLIFS (klifs.net) αC-helix in/out"},
     {"field": "chain_id", "headerName": "Chain", "filter": True, "maxWidth": 100},
     {"field": "residue_range", "headerName": "Residue Range", "filter": True},
     {"field": "mutations_str", "headerName": "Mutations", "filter": True},
@@ -799,7 +807,7 @@ def _cond_card(label: str, key: str) -> rx.Component:
     return rx.box(
         rx.heading(label, size="3"),
         rx.text(State.pdb_conditions[key], white_space="pre-wrap", size="2"),
-        border="1px solid var(--gray-5)", border_radius="8px", padding="0.75rem", width="100%",
+        border="1px solid var(--gray-5)", border_radius="24px", padding="0.9rem 1rem", width="100%",
     )
 
 
@@ -1003,9 +1011,26 @@ def _results_view() -> rx.Component:
             rx.cond(State.collecting, rx.spinner()),
             spacing="2",
         ),
-        rx.heading(State.gene_name + " (" + State.selected_uid + ")", size="6"),
-        rx.text("Organism: " + State.organism + " · Length: "
-                + State.seq_length.to_string() + " aa", color_scheme="gray"),
+        rx.vstack(
+            rx.hstack(
+                rx.heading(State.gene_name, size="7", weight="bold",
+                           color=rx.color("gray", 12)),
+                rx.badge(State.selected_uid, variant="soft", color_scheme="gray",
+                         size="2", radius="full"),
+                spacing="3", align="center", wrap="wrap",
+            ),
+            rx.hstack(
+                rx.text("Organism", size="1", color=rx.color("gray", 10)),
+                rx.text(State.organism, size="2", weight="medium",
+                        color=rx.color("gray", 12)),
+                rx.text("·", color=rx.color("gray", 8)),
+                rx.text("Length", size="1", color=rx.color("gray", 10)),
+                rx.text(State.seq_length.to_string() + " aa", size="2",
+                        weight="medium", color=rx.color("gray", 12)),
+                spacing="2", align="center", wrap="wrap",
+            ),
+            spacing="1", align="start", width="100%",
+        ),
         rx.accordion.root(
             _section("Family & Domains", _domain_track(), "dom"),
             _section("Sequence", _sequence_view(), "seq"),

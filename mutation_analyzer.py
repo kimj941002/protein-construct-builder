@@ -210,6 +210,49 @@ def compare_sequences(wt_sequence: str, pdb_sequence: str,
     return mutations_found
 
 
+def validate_mutation_wt(mutation_code: str, canonical_seq: str) -> bool:
+    """변이 표기 ``X{pos}Y`` 의 WT 글자 X 가 canonical 서열의 pos 위치와 일치하는지 검사.
+
+    **좌표계 정합성 게이트** — author/SEQRES 번호와 UniProt canonical 번호가 어긋난
+    구조에서 변이가 조용히 잘못 매핑되어 저장되는 것을 막는다.
+
+    참고: 현행 적재 경로(compare_sequences)는 WT 글자를 canonical 서열에서 직접
+    읽어 코드를 만들므로 by-construction 항상 통과한다(이 게이트는 현재 데이터에는
+    no-op). 다만 향후 다른 적재 경로(수동 입력·논문 추출 등)가 추가될 때를 위한
+    **안전망**으로 둔다.
+
+    Returns:
+        bool: 일치(또는 비표준 표기로 판정 불가) True / canonical 불일치 False
+    """
+    import re
+    m = re.match(r'^([A-Z])(\d+)([A-Z])$', (mutation_code or "").strip())
+    if not m:
+        return True  # 비표준 표기(예: 결실/삽입)는 이 게이트 대상 아님
+    wt, pos = m.group(1), int(m.group(2))
+    if pos < 1 or pos > len(canonical_seq):
+        return False
+    return canonical_seq[pos - 1] == wt
+
+
+def apply_wt_gate(structure_id: str, classified: list[dict],
+                  canonical_seq: str) -> list[dict]:
+    """분류된 변이 목록에 WT 게이트를 적용 — 불일치 행은 차단하고 로깅한다."""
+    if not canonical_seq:
+        return classified
+    kept = []
+    for mut in classified:
+        if validate_mutation_wt(mut["mutation"], canonical_seq):
+            kept.append(mut)
+        else:
+            import re
+            mm = re.match(r'^([A-Z])(\d+)([A-Z])$', mut["mutation"])
+            pos = int(mm.group(2)) if mm else 0
+            actual = canonical_seq[pos - 1] if 0 < pos <= len(canonical_seq) else "?"
+            print(f"[BLOCK] {structure_id}: WT 불일치로 저장 차단 — {mut['mutation']} "
+                  f"(canonical[{pos}]='{actual}')")
+    return kept
+
+
 def classify_mutations(mutations_found: list[dict],
                        pdbx_mutation: str | None) -> list[dict]:
     """
@@ -314,7 +357,11 @@ def analyze_mutations(structure_id: str, target_uniprot_id: str,
     # 8. engineered / natural_variant 분류
     classified = classify_mutations(raw_mutations, pdbx_mutation)
 
-    # 9. structure_mutations 테이블에 저장
+    # 8b. WT 게이트: canonical(UniProt) 좌표와 불일치하는 변이는 저장 차단 + 로깅
+    #     (좌표계 오염/조용한 오매핑 방지 — C3 정합성)
+    classified = apply_wt_gate(structure_id, classified, wt_sequence)
+
+    # 9. structure_mutations 테이블에 저장 (모든 position 은 UniProt canonical 좌표)
     insert_mutations_bulk(structure_id, classified)
 
     if classified:
