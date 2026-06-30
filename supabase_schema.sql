@@ -303,6 +303,16 @@ CREATE TABLE IF NOT EXISTS bioactivities (
 CREATE INDEX IF NOT EXISTS idx_bioactivities_uniprot ON bioactivities(uniprot_acc);
 CREATE INDEX IF NOT EXISTS idx_bioactivities_chembl  ON bioactivities(chembl_id);
 
+-- ── ligand_chembl_map ── PDB 리간드(CCD) ↔ ChEMBL 화합물 교차참조 (UniChem 캐시)
+-- PDB 구조 ↔ 약물 연결의 다리. 매핑 없으면 chembl_id NULL sentinel 로 저장(재조회 방지).
+CREATE TABLE IF NOT EXISTS ligand_chembl_map (
+    ligand_id  TEXT PRIMARY KEY,   -- PDB CCD code (예: 'VGH')
+    chembl_id  TEXT,               -- 매핑된 ChEMBL ID (없으면 NULL)
+    source     TEXT DEFAULT 'unichem',
+    checked_at TIMESTAMPTZ DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_ligand_chembl_map_chembl ON ligand_chembl_map(chembl_id);
+
 -- ── compound_activity_summary view ── 약물당 대표값 [C2]
 CREATE OR REPLACE VIEW compound_activity_summary AS
 SELECT

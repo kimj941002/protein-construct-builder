@@ -35,6 +35,10 @@ from database import (
     get_paper_pdf,
     get_all_mutations_by_uniprot,
     get_drug_table_by_uniprot,
+    get_drug_table_with_links,
+    get_structures_for_drug,
+    get_drugs_for_structure,
+    get_drug_detail,
     get_papers_by_uniprot,
 )
 from uniprot_fetcher import load_sequence_from_file
@@ -73,6 +77,24 @@ def _inhibitor_type(dfg, ac) -> str:
     if d == "in" and a == "in":
         return "Type I"
     return "-"
+
+
+def _phase_label(max_phase) -> str:
+    """ChEMBL max_phase → 임상 단계 라벨 (Synapse식 비임상/임상 구분)."""
+    if max_phase is None:
+        return "비임상"
+    try:
+        p = float(max_phase)
+    except (TypeError, ValueError):
+        return "비임상"
+    if p >= 4:
+        return "승인 (Phase 4)"
+    if p >= 1:
+        # 0.5 → Early Phase 1
+        return f"Phase {int(p)}" if p == int(p) else f"Phase {p}"
+    if p > 0:
+        return "Early Phase 1"
+    return "비임상"
 
 
 def _materialize_pdf(sid: str, data: bytes | None = None) -> None:
@@ -152,10 +174,20 @@ class State(rx.State):
     mutation_track_items: list[dict] = []   # {left, color, mutation, position, label}
     ruler_ticks: list[dict] = []            # {left, label}
 
-    # 약물 테이블 (ChEMBL bioactivities summary)
+    # 약물 테이블 (ChEMBL bioactivities summary + 결합 PDB 연결)
     drug_rows: list[dict] = []
     chembl_busy: bool = False
     chembl_status: str = ""
+
+    # 약물 상세 (Synapse식 연결 — 약물 클릭 시)
+    selected_drug_id: str = ""
+    drug_detail: dict = {}                   # {pref_name, max_phase, smiles, inchikey}
+    drug_summary: dict = {}                  # {median_pchembl, n_records, best_nm}
+    drug_assays: list[dict] = []             # 대표 assay 표본
+    drug_structures: list[dict] = []         # 이 약물이 결합한 PDB 구조
+
+    # 현재 PDB 에 결합한 약물(ChEMBL 매핑) — PDB 세부 패널용
+    detail_drugs: list[dict] = []
 
     # 논문 (단백질 단위 통합)
     paper_rows: list[dict] = []             # papers 테이블
@@ -303,11 +335,20 @@ class State(rx.State):
             pos += step
         self.ruler_ticks = ticks
 
-        # 약물 테이블 (compound_activity_summary — 데이터 없으면 빈 리스트)
+        # 약물 테이블 (compound_activity_summary + 결합 PDB 연결 — 데이터 없으면 빈 리스트)
         try:
-            self.drug_rows = get_drug_table_by_uniprot(uid)
+            self.drug_rows = get_drug_table_with_links(uid)
         except Exception:
-            self.drug_rows = []
+            try:
+                self.drug_rows = get_drug_table_by_uniprot(uid)
+            except Exception:
+                self.drug_rows = []
+        # 약물 상세 초기화
+        self.selected_drug_id = ""
+        self.drug_detail = {}
+        self.drug_summary = {}
+        self.drug_assays = []
+        self.drug_structures = []
 
         # 논문 (단백질 단위 통합) — foreach 내 문자열 연결 방지 위해 Python 측에서 정규화
         try:
@@ -370,6 +411,18 @@ class State(rx.State):
         self.uploading = False
         self.upload_progress = 0
         self.cond_status = ""
+        # 이 PDB 에 결합한 약물(ChEMBL 매핑) — 구조↔약물 연결
+        try:
+            drugs = get_drugs_for_structure(sid)
+            for d in drugs:
+                d["pref_name"] = d.get("pref_name") or d.get("chembl_id") or ""
+                d["phase_label"] = _phase_label(d.get("max_phase"))
+                d["median_pchembl"] = d.get("median_pchembl")
+                d["chembl_url"] = ("https://www.ebi.ac.uk/chembl/compound_report_card/"
+                                   + (d.get("chembl_id") or ""))
+            self.detail_drugs = drugs
+        except Exception:
+            self.detail_drugs = []
 
     def _resolve_or_collect(self, q: str) -> str | None:
         """DB 우선(UniProt ID/gene 매칭) → 없으면 신규 수집. uid 반환(실패 None). (스레드 실행)"""
@@ -415,22 +468,30 @@ class State(rx.State):
             return State.fetch_chembl
 
     def _do_chembl(self, uid: str) -> dict:
-        """(스레드) ChEMBL 활성 데이터 수집. chembl_fetcher.run 재사용."""
+        """(스레드) ChEMBL 활성 수집 + UniChem 리간드→약물 매핑. 구조↔약물 연결까지 채운다."""
         try:
             from chembl_fetcher import run as chembl_run
-            return chembl_run(uid)
+            res = chembl_run(uid)
+            if res.get("error"):
+                return res
+            try:
+                from unichem_fetcher import run as unichem_run
+                res["unichem"] = unichem_run(uid)
+            except Exception as ue:
+                res["unichem_error"] = str(ue)[:120]
+            return res
         except Exception as e:
             return {"error": f"{type(e).__name__}: {str(e)[:160]}"}
 
     @rx.event(background=True)
     async def fetch_chembl(self):
-        """검색한 단백질의 ChEMBL 활성 데이터를 백그라운드로 수집 → 약물 테이블 갱신."""
+        """검색한 단백질의 ChEMBL 활성 + 리간드→약물 매핑을 백그라운드 수집 → 약물 테이블 갱신."""
         async with self:
             uid = self.selected_uid
             if not uid or self.chembl_busy:
                 return
             self.chembl_busy = True
-            self.chembl_status = "ChEMBL 활성 데이터 수집 중... (수 분 소요될 수 있음)"
+            self.chembl_status = "ChEMBL 활성 + 리간드-약물 매핑 수집 중... (수 분 소요)"
         res = await asyncio.to_thread(self._do_chembl, uid)
         async with self:
             self.chembl_busy = False
@@ -438,15 +499,18 @@ class State(rx.State):
                 self.chembl_status = "수집 실패: " + res["error"]
             else:
                 try:
-                    self.drug_rows = get_drug_table_by_uniprot(uid)
+                    self.drug_rows = get_drug_table_with_links(uid)
                 except Exception:
                     self.drug_rows = []
                 n_c = res.get("compounds", 0)
                 n_b = res.get("bioactivities", 0)
+                uni = res.get("unichem") or {}
                 if n_c == 0 and n_b == 0:
                     self.chembl_status = "이 단백질의 ChEMBL 활성 데이터가 없습니다 (비키나아제·미등록 가능)."
                 else:
-                    self.chembl_status = f"수집 완료 — 약물 {n_c}개 · 활성 {n_b}건"
+                    self.chembl_status = (f"수집 완료 — 약물 {n_c}개 · 활성 {n_b}건"
+                                          + (f" · PDB-약물 매핑 {uni.get('mapped', 0)}개"
+                                             if uni else ""))
 
     @rx.event
     def on_select_structures(self, rows: list[dict]):
@@ -457,6 +521,40 @@ class State(rx.State):
     @rx.event
     def on_row_clicked(self, row: dict):
         sid = row.get("structure_id")
+        if sid:
+            self._load_detail(sid)
+
+    @rx.event
+    def on_drug_clicked(self, row: dict):
+        """약물 행 클릭 → 상세(활성·임상단계·결합 PDB) 로드 (Synapse식 연결)."""
+        cid = row.get("chembl_id")
+        if not cid:
+            return
+        self.selected_drug_id = cid
+        try:
+            det = get_drug_detail(cid, self.selected_uid)
+            comp = det.get("compound", {}) or {}
+            comp["phase_label"] = _phase_label(comp.get("max_phase"))
+            self.drug_detail = comp
+            self.drug_summary = det.get("summary", {}) or {}
+            assays = det.get("assays", []) or []
+            for a in assays:
+                a["assay_description"] = (a.get("assay_description") or "")[:120]
+                a["standard_units"] = a.get("standard_units") or ""
+            self.drug_assays = assays
+        except Exception:
+            self.drug_detail = {}
+            self.drug_summary = {}
+            self.drug_assays = []
+        try:
+            structs = get_structures_for_drug(cid, self.selected_uid)
+            self.drug_structures = structs
+        except Exception:
+            self.drug_structures = []
+
+    @rx.event
+    def open_structure_from_drug(self, sid: str):
+        """약물 상세의 결합 PDB 클릭 → 구조 세부 로드 (축 간 이동)."""
         if sid:
             self._load_detail(sid)
 
@@ -780,17 +878,98 @@ def _protein_overview() -> rx.Component:
 
 # ── Drug / Bioactivity Table (ChEMBL summary) ──
 _DRUG_COLUMN_DEFS = [
-    {"field": "chembl_id",      "headerName": "ChEMBL ID",      "filter": True, "minWidth": 140},
-    {"field": "pref_name",      "headerName": "Drug Name",       "filter": True, "minWidth": 160},
+    {"field": "pref_name",      "headerName": "Drug Name",       "pinned": "left",
+     "filter": True, "minWidth": 170},
     {"field": "max_phase",      "headerName": "Phase",           "filter": True, "maxWidth": 90,
-     "headerTooltip": "최고 임상 단계 (ChEMBL max_phase)"},
+     "headerTooltip": "최고 임상 단계 (ChEMBL max_phase): 4=승인, 1-3=임상, 공백=비임상"},
     {"field": "median_pchembl", "headerName": "Median pChEMBL",  "filter": "agNumberColumnFilter",
-     "maxWidth": 150, "headerTooltip": "여러 어세이의 중앙값 pChEMBL (−log₁₀ 몰 농도)"},
+     "maxWidth": 150, "headerTooltip": "여러 어세이의 중앙값 pChEMBL (−log₁₀ 몰 농도). 높을수록 강력"},
     {"field": "best_nm",        "headerName": "Best (nM)",       "filter": "agNumberColumnFilter",
      "maxWidth": 120, "headerTooltip": "농도 단위 어세이 중 최저 IC50/Ki (nM)"},
     {"field": "n_records",      "headerName": "# Assays",        "filter": "agNumberColumnFilter",
-     "maxWidth": 110},
+     "maxWidth": 105},
+    {"field": "n_pdb",          "headerName": "결합 PDB",         "filter": "agNumberColumnFilter",
+     "maxWidth": 110, "headerTooltip": "이 약물의 리간드가 결합한 이 단백질의 PDB 구조 수 (UniChem 매핑)"},
+    {"field": "chembl_id",      "headerName": "ChEMBL ID",       "filter": True, "minWidth": 130},
 ]
+
+
+def _drug_struct_chip(s: dict) -> rx.Component:
+    """약물 상세의 결합 PDB 칩 — 클릭 시 구조 세부로 이동(축 간 연결)."""
+    return rx.button(
+        s["structure_id"],
+        on_click=State.open_structure_from_drug(s["structure_id"]),
+        variant="soft", size="1", color_scheme="gray",
+    )
+
+
+def _drug_assay_row(a: dict) -> rx.Component:
+    return rx.hstack(
+        rx.text(a["standard_type"], size="1", weight="medium", width="60px"),
+        rx.text(a["standard_value"], " ", a["standard_units"],
+                size="1", color=rx.color("gray", 11), width="110px"),
+        rx.text("pChEMBL ", a["pchembl_value"], size="1",
+                color=rx.color("accent", 10), width="110px"),
+        rx.text(a["assay_description"], size="1", color=rx.color("gray", 9)),
+        spacing="2", align="center", width="100%", wrap="nowrap",
+    )
+
+
+def _drug_detail_panel() -> rx.Component:
+    """약물 상세 — 활성·임상단계·결합 PDB·논문 (Synapse식 약물 중심 연결)."""
+    return rx.cond(
+        State.selected_drug_id != "",
+        rx.box(
+            rx.vstack(
+                rx.hstack(
+                    rx.icon("pill", size=18, color=rx.color("accent", 9)),
+                    rx.heading(State.drug_detail["pref_name"], size="4"),
+                    rx.badge(State.drug_detail["phase_label"], color_scheme="jade",
+                             variant="soft", size="2"),
+                    rx.link("ChEMBL ↗",
+                            href="https://www.ebi.ac.uk/chembl/compound_report_card/" + State.selected_drug_id,
+                            is_external=True, size="2"),
+                    spacing="3", align="center", wrap="wrap",
+                ),
+                # 활성 요약
+                rx.hstack(
+                    _kv("Median pChEMBL", State.drug_summary["median_pchembl"].to_string()),
+                    _kv("Best (nM)", State.drug_summary["best_nm"].to_string()),
+                    _kv("Assays", State.drug_summary["n_records"].to_string()),
+                    _kv("Max phase", State.drug_detail["max_phase"].to_string()),
+                    wrap="wrap", spacing="4",
+                ),
+                # 결합 PDB 구조 (구조 축으로 이동)
+                rx.cond(
+                    State.drug_structures.length() > 0,
+                    rx.vstack(
+                        rx.text("결합 PDB 구조 (클릭 → 구조 세부)", size="2", weight="bold",
+                                color=rx.color("gray", 11)),
+                        rx.hstack(rx.foreach(State.drug_structures, _drug_struct_chip),
+                                  wrap="wrap", spacing="2"),
+                        spacing="1", align="start", width="100%",
+                    ),
+                    rx.text("이 약물과 매핑된 PDB 구조가 없습니다 (리간드 미결합 또는 UniChem 미등록).",
+                            size="1", color=rx.color("gray", 9)),
+                ),
+                # 대표 assay 표본
+                rx.cond(
+                    State.drug_assays.length() > 0,
+                    rx.vstack(
+                        rx.text("대표 활성 측정 (상위 pChEMBL)", size="2", weight="bold",
+                                color=rx.color("gray", 11)),
+                        rx.vstack(rx.foreach(State.drug_assays, _drug_assay_row),
+                                  spacing="1", width="100%", align="start"),
+                        spacing="1", align="start", width="100%",
+                    ),
+                ),
+                spacing="3", align="start", width="100%",
+            ),
+            border="1px solid var(--gray-5)", border_radius="16px",
+            padding="1.1rem 1.25rem", width="100%", background=rx.color("gray", 2),
+            margin_top="0.5rem",
+        ),
+    )
 
 
 def _drug_table() -> rx.Component:
@@ -798,7 +977,7 @@ def _drug_table() -> rx.Component:
         rx.hstack(
             rx.button(
                 rx.cond(State.chembl_busy, rx.spinner(), rx.icon("download", size=14)),
-                "ChEMBL 활성 데이터 가져오기/갱신",
+                "ChEMBL 활성 + PDB-약물 매핑 가져오기/갱신",
                 on_click=State.fetch_chembl, disabled=State.chembl_busy, size="2",
                 variant="soft",
             ),
@@ -808,17 +987,25 @@ def _drug_table() -> rx.Component:
         ),
         rx.cond(
             State.drug_rows.length() > 0,
-            rx.box(
-                ag_grid(
-                    column_defs=_DRUG_COLUMN_DEFS,
-                    row_data=State.drug_rows,
-                    default_col_def={"sortable": True, "resizable": True, "floatingFilter": True},
-                    pagination=True,
-                    pagination_page_size=20,
+            rx.vstack(
+                rx.text("행을 클릭하면 아래에 약물 상세(활성·임상단계·결합 PDB·논문)가 나타납니다.",
+                        size="1", color=rx.color("gray", 9)),
+                rx.box(
+                    ag_grid(
+                        column_defs=_DRUG_COLUMN_DEFS,
+                        row_data=State.drug_rows,
+                        default_col_def={"sortable": True, "resizable": True, "floatingFilter": True},
+                        row_selection="single",
+                        pagination=True,
+                        pagination_page_size=20,
+                        on_row_clicked=State.on_drug_clicked,
+                    ),
+                    width="100%",
+                    height="400px",
+                    custom_attrs={"data-ag-theme-mode": "dark"},
                 ),
-                width="100%",
-                height="400px",
-                custom_attrs={"data-ag-theme-mode": "dark"},
+                _drug_detail_panel(),
+                spacing="2", width="100%", align="start",
             ),
             rx.cond(
                 ~State.chembl_busy,
@@ -932,6 +1119,20 @@ def _lig_item(l: dict) -> rx.Component:
     return rx.text("• ", l["ligand_id"], "  ", l["ligand_name"], size="2")
 
 
+def _bound_drug_item(d: dict) -> rx.Component:
+    """PDB 세부 패널의 결합 약물 한 줄 — 약물명·임상단계·활성·ChEMBL 링크."""
+    return rx.hstack(
+        rx.badge(d["ligand_id"], variant="soft", color_scheme="gray", size="1"),
+        rx.text(d["pref_name"], size="2", weight="bold"),
+        rx.badge(d["phase_label"], color_scheme="jade", variant="soft", size="1"),
+        rx.cond(d["median_pchembl"] != None,
+                rx.text("pChEMBL " + d["median_pchembl"].to_string(), size="1",
+                        color=rx.color("accent", 10))),
+        rx.link("↗", href=d["chembl_url"], is_external=True, size="1"),
+        spacing="2", align="center", wrap="wrap",
+    )
+
+
 def _partner_item(p: dict) -> rx.Component:
     return rx.text("• ", p["partner_gene_name"], " (", p["partner_uniprot_id"],
                    ")  chains: ", p["chains_str"], size="2")
@@ -981,6 +1182,18 @@ def _pdb_detail_panel() -> rx.Component:
             rx.cond(State.detail_ligands.length() > 0,
                     rx.vstack(rx.text("Ligands", weight="bold", size="2"),
                               rx.foreach(State.detail_ligands, _lig_item), spacing="0", align="start")),
+            # 결합 리간드 중 알려진 약물(ChEMBL) — 구조→약물 연결
+            rx.cond(
+                State.detail_drugs.length() > 0,
+                rx.box(
+                    rx.text("💊 결합 약물 (ChEMBL)", weight="bold", size="2",
+                            color=rx.color("accent", 11)),
+                    rx.vstack(rx.foreach(State.detail_drugs, _bound_drug_item),
+                              spacing="1", align="start", width="100%"),
+                    border="1px solid var(--accent-6)", border_radius="12px",
+                    padding="0.7rem 0.9rem", width="100%", margin_top="0.3rem",
+                ),
+            ),
             rx.cond(State.detail_partners.length() > 0,
                     rx.vstack(rx.text("Partner proteins", weight="bold", size="2"),
                               rx.foreach(State.detail_partners, _partner_item), spacing="0", align="start")),

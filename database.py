@@ -13,9 +13,23 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from decimal import Decimal
+
 from sqlalchemy import text, bindparam
 
 from db_config import get_engine
+
+
+def _jsonable(rows: list) -> list[dict]:
+    """Decimal → float 변환 (Reflex State JSON 직렬화 안전). mappings() 결과용."""
+    out = []
+    for r in rows:
+        d = dict(r)
+        for k, v in d.items():
+            if isinstance(v, Decimal):
+                d[k] = float(v)
+        out.append(d)
+    return out
 
 
 # ═══════════════════════════════════════════
@@ -717,7 +731,92 @@ def get_drug_table_by_uniprot(uniprot_id: str) -> list[dict]:
             WHERE uniprot_acc = :uid
             ORDER BY median_pchembl DESC NULLS LAST
         """), {"uid": uniprot_id}).mappings().all()
-    return [dict(r) for r in rows]
+    return _jsonable(rows)
+
+
+def get_drug_table_with_links(uniprot_id: str) -> list[dict]:
+    """약물 요약 + 결합 PDB 구조 수(n_pdb) 를 함께 반환 (Synapse식 연결용).
+
+    compound_activity_summary 에 ligand_chembl_map↔ligands 경유 구조 카운트를 붙인다.
+    """
+    with get_engine().connect() as conn:
+        rows = conn.execute(text("""
+            SELECT s.chembl_id, s.pref_name, s.max_phase,
+                   ROUND(s.median_pchembl::numeric, 2) AS median_pchembl,
+                   s.n_records,
+                   ROUND(s.best_nM::numeric, 1)        AS best_nm,
+                   COALESCE(pc.n_pdb, 0)               AS n_pdb
+            FROM compound_activity_summary s
+            LEFT JOIN (
+                SELECT m.chembl_id, count(DISTINCT l.structure_id) AS n_pdb
+                FROM ligand_chembl_map m
+                JOIN ligands l ON l.ligand_id = m.ligand_id
+                JOIN pdb_structures p ON p.structure_id = l.structure_id
+                WHERE m.chembl_id IS NOT NULL AND p.uniprot_id = :uid
+                GROUP BY m.chembl_id
+            ) pc ON pc.chembl_id = s.chembl_id
+            WHERE s.uniprot_acc = :uid
+            ORDER BY s.median_pchembl DESC NULLS LAST
+        """), {"uid": uniprot_id}).mappings().all()
+    return _jsonable(rows)
+
+
+def get_structures_for_drug(chembl_id: str, uniprot_id: str) -> list[dict]:
+    """이 약물(ChEMBL)의 리간드가 결합한 이 단백질의 PDB 구조 목록."""
+    with get_engine().connect() as conn:
+        rows = conn.execute(text("""
+            SELECT DISTINCT l.structure_id, m.ligand_id, ps.resolution, ps.method
+            FROM ligand_chembl_map m
+            JOIN ligands l ON l.ligand_id = m.ligand_id
+            JOIN pdb_structures ps ON ps.structure_id = l.structure_id
+            WHERE m.chembl_id = :cid AND ps.uniprot_id = :uid
+            ORDER BY l.structure_id
+        """), {"cid": chembl_id, "uid": uniprot_id}).mappings().all()
+    return _jsonable(rows)
+
+
+def get_drugs_for_structure(structure_id: str) -> list[dict]:
+    """이 PDB 구조의 결합 리간드 중 ChEMBL 약물로 매핑된 것 + 활성·임상단계."""
+    with get_engine().connect() as conn:
+        rows = conn.execute(text("""
+            SELECT DISTINCT m.ligand_id, m.chembl_id, c.pref_name, c.max_phase,
+                   ROUND(s.median_pchembl::numeric, 2) AS median_pchembl
+            FROM ligands l
+            JOIN ligand_chembl_map m ON m.ligand_id = l.ligand_id
+            JOIN compounds c ON c.chembl_id = m.chembl_id
+            LEFT JOIN compound_activity_summary s
+                   ON s.chembl_id = m.chembl_id
+            WHERE l.structure_id = :sid AND m.chembl_id IS NOT NULL
+            ORDER BY c.max_phase DESC NULLS LAST
+        """), {"sid": structure_id}).mappings().all()
+    return _jsonable(rows)
+
+
+def get_drug_detail(chembl_id: str, uniprot_id: str) -> dict:
+    """약물 1개의 상세 — 화합물 메타 + 활성 요약 + assay 표본."""
+    with get_engine().connect() as conn:
+        comp = conn.execute(text(
+            "SELECT chembl_id, pref_name, canonical_smiles, inchikey, max_phase "
+            "FROM compounds WHERE chembl_id = :cid"
+        ), {"cid": chembl_id}).mappings().first()
+        summ = conn.execute(text(
+            "SELECT ROUND(median_pchembl::numeric,2) AS median_pchembl, n_records, "
+            "ROUND(best_nM::numeric,1) AS best_nm "
+            "FROM compound_activity_summary WHERE chembl_id = :cid AND uniprot_acc = :uid"
+        ), {"cid": chembl_id, "uid": uniprot_id}).mappings().first()
+        assays = conn.execute(text("""
+            SELECT standard_type, standard_value, standard_units,
+                   ROUND(pchembl_value::numeric, 2) AS pchembl_value, assay_description
+            FROM bioactivities
+            WHERE chembl_id = :cid AND uniprot_acc = :uid AND pchembl_value IS NOT NULL
+            ORDER BY pchembl_value DESC NULLS LAST
+            LIMIT 12
+        """), {"cid": chembl_id, "uid": uniprot_id}).mappings().all()
+    return {
+        "compound": _jsonable([comp])[0] if comp else {},
+        "summary": _jsonable([summ])[0] if summ else {},
+        "assays": _jsonable(assays),
+    }
 
 
 def get_papers_by_uniprot(uniprot_id: str) -> list[dict]:
