@@ -657,6 +657,36 @@ def get_drug_table_by_uniprot(uniprot_id: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_papers_by_uniprot(uniprot_id: str) -> list[dict]:
+    """이 단백질의 PDB 구조에 연결된 논문 + paper_analysis 요약을 통합 반환.
+
+    papers 테이블(전체 분석)과 paper_analysis(PDB별 구조화 분석)를 함께 본다.
+    """
+    with get_engine().connect() as conn:
+        # papers: structure_id 가 이 단백질의 구조인 것
+        rows = conn.execute(text("""
+            SELECT p.paper_id, p.title, p.doi, p.authors, p.structure_id,
+                   p.analyzed_at, p.model
+            FROM papers p
+            JOIN pdb_structures ps ON p.structure_id = ps.structure_id
+            WHERE ps.uniprot_id = :uid
+            ORDER BY p.created_at DESC
+        """), {"uid": uniprot_id}).mappings().all()
+        papers = [dict(r) for r in rows]
+
+        # paper_analysis: 이 단백질 구조 중 구조화 분석(structured)이 있는 것
+        arows = conn.execute(text("""
+            SELECT pa.structure_id, pa.pdf_name, pa.status, pa.analyzed_at,
+                   (pa.structured IS NOT NULL) AS has_structured
+            FROM paper_analysis pa
+            JOIN pdb_structures ps ON pa.structure_id = ps.structure_id
+            WHERE ps.uniprot_id = :uid AND pa.pdf_name IS NOT NULL
+            ORDER BY pa.analyzed_at DESC NULLS LAST
+        """), {"uid": uniprot_id}).mappings().all()
+        analyses = [dict(r) for r in arows]
+    return papers, analyses
+
+
 # ─────────────────────────────────────────────
 # 직접 실행 시 스키마 적용 + 테이블 확인
 # 터미널: python database.py

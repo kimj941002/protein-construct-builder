@@ -1,3 +1,7 @@
+.states
+*.db
+.web
+assets/external/
 # 데이터베이스 — 단일 진실의 원천은 Supabase(Postgres). (UNIFIED_MIGRATION_PLAN.md)
 # protein_data.db 는 Supabase 이전 완료 후 추적 제외 (로컬 원본 백업으로만 보관).
 protein_data.db
