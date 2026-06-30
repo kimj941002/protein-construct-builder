@@ -38,3 +38,6 @@ reflex.lock/
 
 # 논문 PDF (저작권 — GitHub에 올리지 말 것)
 papers/*.pdf
+
+# 로컬 preview 실행 설정 (머신별 절대경로)
+.claude/launch.json
