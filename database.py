@@ -563,6 +563,100 @@ def upsert_paper_conditions(structure_id: str, conditions: dict, status: str = "
                "j": json.dumps(conditions, ensure_ascii=False)})
 
 
+# ═══════════════════════════════════════════
+# cMET MVP v2 — compounds / bioactivities CRUD
+# ═══════════════════════════════════════════
+
+def upsert_compound(data: dict):
+    """
+    compounds 테이블 upsert.
+    data 키: chembl_id, pref_name, canonical_smiles, inchikey, max_phase
+    """
+    with get_engine().begin() as conn:
+        conn.execute(text("""
+            INSERT INTO compounds (chembl_id, pref_name, canonical_smiles, inchikey, max_phase)
+            VALUES (:chembl_id, :pref_name, :canonical_smiles, :inchikey, :max_phase)
+            ON CONFLICT (chembl_id) DO UPDATE SET
+                pref_name        = EXCLUDED.pref_name,
+                canonical_smiles = EXCLUDED.canonical_smiles,
+                inchikey         = EXCLUDED.inchikey,
+                max_phase        = EXCLUDED.max_phase
+        """), {
+            "chembl_id":        data.get("chembl_id"),
+            "pref_name":        data.get("pref_name"),
+            "canonical_smiles": data.get("canonical_smiles"),
+            "inchikey":         data.get("inchikey"),
+            "max_phase":        data.get("max_phase"),
+        })
+
+
+def upsert_bioactivity(data: dict):
+    """
+    bioactivities 테이블 upsert.
+    data 키: chembl_id, uniprot_acc, standard_type, standard_value, standard_units,
+             value_nM_normalized, pchembl_value, assay_chembl_id, assay_description,
+             document_chembl_id
+    """
+    with get_engine().begin() as conn:
+        conn.execute(text("""
+            INSERT INTO bioactivities
+                (chembl_id, uniprot_acc, standard_type, standard_value, standard_units,
+                 value_nM_normalized, pchembl_value, assay_chembl_id, assay_description,
+                 document_chembl_id)
+            VALUES
+                (:chembl_id, :uniprot_acc, :standard_type, :standard_value, :standard_units,
+                 :value_nM_normalized, :pchembl_value, :assay_chembl_id, :assay_description,
+                 :document_chembl_id)
+            ON CONFLICT (chembl_id, uniprot_acc, assay_chembl_id, standard_type) DO UPDATE SET
+                standard_value      = EXCLUDED.standard_value,
+                standard_units      = EXCLUDED.standard_units,
+                value_nM_normalized = EXCLUDED.value_nM_normalized,
+                pchembl_value       = EXCLUDED.pchembl_value,
+                assay_description   = EXCLUDED.assay_description,
+                document_chembl_id  = EXCLUDED.document_chembl_id
+        """), {
+            "chembl_id":          data.get("chembl_id"),
+            "uniprot_acc":        data.get("uniprot_acc"),
+            "standard_type":      data.get("standard_type"),
+            "standard_value":     data.get("standard_value"),
+            "standard_units":     data.get("standard_units"),
+            "value_nM_normalized": data.get("value_nM_normalized"),
+            "pchembl_value":      data.get("pchembl_value"),
+            "assay_chembl_id":    data.get("assay_chembl_id") or "",
+            "assay_description":  data.get("assay_description"),
+            "document_chembl_id": data.get("document_chembl_id"),
+        })
+
+
+def get_all_mutations_by_uniprot(uniprot_id: str) -> list[dict]:
+    """UniProt 단백질 전체 구조에 걸쳐 고유 변이 목록 반환 (mutations track 용)."""
+    with get_engine().connect() as conn:
+        rows = conn.execute(text("""
+            SELECT DISTINCT sm.mutation, sm.position, sm.mutation_type
+            FROM structure_mutations sm
+            JOIN pdb_structures ps ON sm.structure_id = ps.structure_id
+            WHERE ps.uniprot_id = :uid
+              AND sm.position IS NOT NULL
+            ORDER BY sm.position, sm.mutation
+        """), {"uid": uniprot_id}).mappings().all()
+    return [dict(r) for r in rows]
+
+
+def get_drug_table_by_uniprot(uniprot_id: str) -> list[dict]:
+    """compound_activity_summary 뷰에서 약물 테이블 데이터 반환."""
+    with get_engine().connect() as conn:
+        rows = conn.execute(text("""
+            SELECT chembl_id, pref_name, max_phase,
+                   ROUND(median_pchembl::numeric, 2) AS median_pchembl,
+                   n_records,
+                   ROUND(best_nM::numeric, 1)        AS best_nM
+            FROM compound_activity_summary
+            WHERE uniprot_acc = :uid
+            ORDER BY median_pchembl DESC NULLS LAST
+        """), {"uid": uniprot_id}).mappings().all()
+    return [dict(r) for r in rows]
+
+
 # ─────────────────────────────────────────────
 # 직접 실행 시 스키마 적용 + 테이블 확인
 # 터미널: python database.py

@@ -1,9 +1,8 @@
 """
-Protein Construct Builder — 통합 Reflex 앱
-==========================================
-UNIFIED_MIGRATION_PLAN.md / REFLEX_UNIFIED_PLAN.md.
-좌측 사이드바로 Construct Builder / Paper Analyzer / Knowledge Base 를 오간다.
-DB 접근은 database.py·collect.py 의 서비스 함수만 호출(스키마 재정의 없음).
+Protein Construct Builder — cMET 중심 구조 탐색 앱 (Reflex 0.9.6)
+===================================================================
+단일 페이지: PDB database (/) — 단백질 검색 → KLIFS 구조 표 → 변이 트랙 → 약물 테이블
+DB 접근은 database.py·collect.py 의 서비스 함수만 호출.
 """
 import asyncio
 import os
@@ -34,11 +33,11 @@ from database import (
     upsert_paper_conditions,
     save_paper_pdf,
     get_paper_pdf,
+    get_all_mutations_by_uniprot,
+    get_drug_table_by_uniprot,
 )
 from uniprot_fetcher import load_sequence_from_file
 from collect import collect_protein
-import knowledge as K
-import customllm as CL
 
 # 도메인 트랙 색상
 _DOMAIN_COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3",
@@ -148,30 +147,12 @@ class State(rx.State):
     upload_progress: int = 0
     has_pdf: bool = False   # 현재 PDB 에 저장된 PDF 있는지
 
-    # Phase 3 — Knowledge Base
-    kb_topics: list[dict] = []
-    kb_new_topic_name: str = ""
-    kb_selected_topic_id: int = 0
-    kb_selected_topic_name: str = ""
-    kb_links: list[dict] = []
-    kb_insights: list[dict] = []
-    kb_link_type: str = "structure"
-    kb_link_id: str = ""
-    kb_search_query: str = ""
-    kb_search_results: list[dict] = []
-    kb_busy: bool = False
-    kb_status: str = ""
+    # cMET 변이 트랙 (protein-level, CSS-positioned)
+    mutation_track_items: list[dict] = []   # {left, color, mutation, position, label}
+    ruler_ticks: list[dict] = []            # {left, label}
 
-    # R4 — Custom LLM (트리 대화)
-    llm_rooms: list[dict] = []
-    llm_selected_room_id: int = 0
-    llm_selected_title: str = ""
-    llm_messages: list[dict] = []
-    llm_input: str = ""
-    llm_new_topic: str = ""
-    llm_branch_title: str = ""
-    llm_busy: bool = False
-    llm_status: str = ""
+    # 약물 테이블 (ChEMBL bioactivities summary)
+    drug_rows: list[dict] = []
 
     @rx.var
     def structure_count(self) -> int:
@@ -246,6 +227,45 @@ class State(rx.State):
             s["ac_helix"] = k.get("ac_helix") or "-"
             s["inhibitor_type"] = _inhibitor_type(k.get("dfg"), k.get("ac_helix"))
         self.structures = structs
+
+        # 변이 트랙 — protein 전체 고유 변이 위치
+        all_muts = get_all_mutations_by_uniprot(uid)
+        denom = seq_len or 1390
+        seen_keys: set = set()
+        track_items = []
+        for m in all_muts:
+            pos = m.get("position")
+            if not pos:
+                continue
+            key = (pos, m.get("mutation", ""))
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            left = max(0.0, (pos - 1) / denom * 100)
+            track_items.append({
+                "left": f"{left:.2f}%",
+                "color": "#6b7cff",   # 단일 색상 (category 데이터 미구현)
+                "mutation": m.get("mutation", ""),
+                "position": str(pos),
+                "label": f"{m.get('mutation', '')} @ {pos}",
+            })
+        self.mutation_track_items = track_items
+
+        # 눈금: 200 aa 간격 (0~seq_len)
+        ticks = []
+        step = 200
+        pos = 1
+        while pos <= denom:
+            ticks.append({"left": f"{(pos - 1) / denom * 100:.2f}%", "label": str(pos)})
+            pos += step
+        self.ruler_ticks = ticks
+
+        # 약물 테이블 (compound_activity_summary — 데이터 없으면 빈 리스트)
+        try:
+            self.drug_rows = get_drug_table_by_uniprot(uid)
+        except Exception:
+            self.drug_rows = []
+
         # 세부 패널 초기화
         self.detail_sid = ""
         self.detail = {}
@@ -511,179 +531,6 @@ class State(rx.State):
                 self.analyze_status = "분석 완료 — Supabase(papers) 저장됨"
                 self.analyze_result_md = res["output_md"]
 
-    # ── Phase 3: Knowledge Base ──
-    @rx.event
-    def set_kb_new_topic_name(self, v: str):
-        self.kb_new_topic_name = v
-
-    @rx.event
-    def set_kb_link_type(self, v: str):
-        self.kb_link_type = v
-
-    @rx.event
-    def set_kb_link_id(self, v: str):
-        self.kb_link_id = v
-
-    @rx.event
-    def set_kb_search_query(self, v: str):
-        self.kb_search_query = v
-
-    @rx.event
-    def kb_load_topics(self):
-        self.kb_topics = K.list_topics()
-
-    @rx.event
-    def kb_create_topic(self):
-        name = self.kb_new_topic_name.strip()
-        if not name:
-            return
-        K.create_topic(name)
-        self.kb_new_topic_name = ""
-        self.kb_topics = K.list_topics()
-
-    @rx.event
-    def kb_select_topic(self, topic_id: int, name: str):
-        self.kb_selected_topic_id = topic_id
-        self.kb_selected_topic_name = name
-        self.kb_links = K.get_links(topic_id)
-        self.kb_insights = K.list_insights(topic_id)
-
-    @rx.event
-    def kb_add_link(self):
-        if not self.kb_selected_topic_id or not self.kb_link_id.strip():
-            return
-        K.add_link(self.kb_selected_topic_id, self.kb_link_type, self.kb_link_id.strip())
-        self.kb_link_id = ""
-        self.kb_links = K.get_links(self.kb_selected_topic_id)
-
-    @rx.event(background=True)
-    async def kb_synthesize(self):
-        async with self:
-            if not self.kb_selected_topic_id:
-                return
-            self.kb_busy = True
-            self.kb_status = "LLM 종합 인사이트 생성 중... (수십 초)"
-            tid = self.kb_selected_topic_id
-        res = await asyncio.to_thread(K.synthesize_topic, tid)
-        async with self:
-            self.kb_busy = False
-            if res.get("error"):
-                self.kb_status = "오류: " + res["error"]
-            else:
-                self.kb_status = "종합 완료 — insight 저장·임베딩됨"
-                self.kb_insights = K.list_insights(tid)
-
-    @rx.event(background=True)
-    async def kb_reindex(self):
-        async with self:
-            self.kb_busy = True
-            self.kb_status = "기존 논문/분석 임베딩(재색인) 중..."
-        n = await asyncio.to_thread(K.reindex_papers)
-        async with self:
-            self.kb_busy = False
-            self.kb_status = f"재색인 완료: {n}건 임베딩됨"
-
-    @rx.event(background=True)
-    async def kb_search(self):
-        q = self.kb_search_query.strip()
-        if not q:
-            return
-        async with self:
-            self.kb_busy = True
-            self.kb_status = "의미검색 중..."
-        results = await asyncio.to_thread(K.semantic_search, q, 8)
-        async with self:
-            self.kb_busy = False
-            self.kb_status = ""
-            self.kb_search_results = results
-
-    # ── R4: Custom LLM (트리 대화) ──
-    @rx.event
-    def set_llm_input(self, v: str):
-        self.llm_input = v
-
-    @rx.event
-    def set_llm_new_topic(self, v: str):
-        self.llm_new_topic = v
-
-    @rx.event
-    def set_llm_branch_title(self, v: str):
-        self.llm_branch_title = v
-
-    @rx.event
-    def llm_load_rooms(self):
-        self.llm_rooms = CL.list_rooms()
-
-    @rx.event
-    def llm_create_topic(self):
-        t = self.llm_new_topic.strip()
-        if not t:
-            return
-        CL.create_topic_room(t)
-        self.llm_new_topic = ""
-        self.llm_rooms = CL.list_rooms()
-
-    @rx.event
-    def llm_select_room(self, room_id: int, title: str):
-        self.llm_selected_room_id = room_id
-        self.llm_selected_title = title
-        self.llm_messages = CL.get_messages(room_id)
-        self.llm_status = ""
-
-    @rx.event
-    def llm_delete_room(self, room_id: int):
-        CL.delete_room(room_id)
-        if self.llm_selected_room_id == room_id:
-            self.llm_selected_room_id = 0
-            self.llm_messages = []
-        self.llm_rooms = CL.list_rooms()
-
-    @rx.event(background=True)
-    async def llm_send(self):
-        txt = self.llm_input.strip()
-        async with self:
-            if not txt or not self.llm_selected_room_id:
-                return
-            self.llm_busy = True
-            self.llm_status = "LLM 응답 생성 중... (필요 시 DB 조회)"
-            self.llm_input = ""
-            rid = self.llm_selected_room_id
-        await asyncio.to_thread(CL.send_message, rid, txt)
-        async with self:
-            self.llm_busy = False
-            self.llm_status = ""
-            self.llm_messages = CL.get_messages(rid)
-
-    @rx.event(background=True)
-    async def llm_branch(self):
-        async with self:
-            t = self.llm_branch_title.strip()
-            if not t or not self.llm_selected_room_id:
-                self.llm_status = "분화할 소주제 제목 + 현재 방 선택이 필요합니다."
-                return
-            self.llm_busy = True
-            self.llm_status = "소주제 분화 중 (상위 맥락 요약)..."
-            pid = self.llm_selected_room_id
-            self.llm_branch_title = ""
-        await asyncio.to_thread(CL.branch_room, pid, t)
-        async with self:
-            self.llm_busy = False
-            self.llm_status = "분화 완료"
-            self.llm_rooms = CL.list_rooms()
-
-    @rx.event(background=True)
-    async def llm_rollup(self):
-        async with self:
-            if not self.llm_selected_room_id:
-                return
-            self.llm_busy = True
-            self.llm_status = "하위 대화 통찰 종합 중..."
-            rid = self.llm_selected_room_id
-        res = await asyncio.to_thread(CL.rollup_insight, rid)
-        async with self:
-            self.llm_busy = False
-            self.llm_status = res.get("error") or "통찰 종합 완료"
-            self.llm_messages = CL.get_messages(rid)
 
 
 # ═══════════════════════════════════════════
@@ -760,6 +607,105 @@ def _domain_track() -> rx.Component:
             spacing="2", align="start", width="100%",
         ),
         rx.text("도메인 정보 없음", color_scheme="gray", size="2"),
+    )
+
+
+# ── Mutations Feature Track ──
+def _mut_pin(item: dict) -> rx.Component:
+    return rx.tooltip(
+        rx.box(
+            position="absolute", left=item["left"],
+            top="0", width="2px", height="32px",
+            background=item["color"],
+            border_radius="1px",
+        ),
+        content=item["label"],
+    )
+
+
+def _ruler_tick(t: dict) -> rx.Component:
+    return rx.box(
+        rx.box(
+            position="absolute", left=t["left"],
+            top="0", width="1px", height="6px",
+            background=rx.color("gray", 7),
+        ),
+        rx.text(
+            t["label"],
+            position="absolute", left=t["left"],
+            top="8px", font_size="0.6rem",
+            color=rx.color("gray", 9), transform="translateX(-50%)",
+        ),
+        position="absolute", left=t["left"], top="0",
+    )
+
+
+def _mutations_track() -> rx.Component:
+    return rx.cond(
+        State.mutation_track_items.length() > 0,
+        rx.vstack(
+            # 1D ruler with position ticks
+            rx.box(
+                rx.foreach(State.ruler_ticks, _ruler_tick),
+                position="relative", width="100%", height="26px",
+                background="transparent", overflow="visible",
+            ),
+            # Mutation pins bar
+            rx.box(
+                rx.box(
+                    position="absolute", left="0", top="0",
+                    width="100%", height="32px",
+                    background=rx.color("gray", 3),
+                    border_radius="4px",
+                ),
+                rx.foreach(State.mutation_track_items, _mut_pin),
+                position="relative", width="100%", height="32px",
+            ),
+            rx.text(
+                State.mutation_track_items.length().to_string() + " 고유 변이 (여러 PDB 구조 합산)",
+                size="1", color=rx.color("gray", 9),
+            ),
+            spacing="1", align="start", width="100%",
+        ),
+        rx.text("변이 데이터 없음", color_scheme="gray", size="2"),
+    )
+
+
+# ── Drug / Bioactivity Table (ChEMBL summary) ──
+_DRUG_COLUMN_DEFS = [
+    {"field": "chembl_id",      "headerName": "ChEMBL ID",      "filter": True, "minWidth": 140},
+    {"field": "pref_name",      "headerName": "Drug Name",       "filter": True, "minWidth": 160},
+    {"field": "max_phase",      "headerName": "Phase",           "filter": True, "maxWidth": 90,
+     "headerTooltip": "최고 임상 단계 (ChEMBL max_phase)"},
+    {"field": "median_pchembl", "headerName": "Median pChEMBL",  "filter": "agNumberColumnFilter",
+     "maxWidth": 150, "headerTooltip": "여러 어세이의 중앙값 pChEMBL (−log₁₀ 몰 농도)"},
+    {"field": "best_nM",        "headerName": "Best (nM)",       "filter": "agNumberColumnFilter",
+     "maxWidth": 120, "headerTooltip": "농도 단위 어세이 중 최저 IC50/Ki (nM)"},
+    {"field": "n_records",      "headerName": "# Assays",        "filter": "agNumberColumnFilter",
+     "maxWidth": 110},
+]
+
+
+def _drug_table() -> rx.Component:
+    return rx.cond(
+        State.drug_rows.length() > 0,
+        rx.box(
+            ag_grid(
+                column_defs=_DRUG_COLUMN_DEFS,
+                row_data=State.drug_rows,
+                default_col_def={"sortable": True, "resizable": True, "floatingFilter": True},
+                pagination=True,
+                pagination_page_size=20,
+            ),
+            width="100%",
+            height="400px",
+            custom_attrs={"data-ag-theme-mode": "dark"},
+        ),
+        rx.callout(
+            "ChEMBL 데이터 없음 — 터미널에서 python chembl_fetcher.py 를 실행하세요.",
+            icon="info",
+            color_scheme="gray",
+        ),
     )
 
 
@@ -926,8 +872,6 @@ def sidebar() -> rx.Component:
     return rx.vstack(
         rx.heading("🧬 Structure research", size="5", margin_bottom="0.5rem"),
         _nav_link("🗄️ PDB database", "/"),
-        _nav_link("🤖 Custom LLM", "/analyzer"),
-        _nav_link("🧠 Knowledge Base", "/knowledge"),
         spacing="1", align="start",
         width="220px", height="100vh", padding="1rem",
         background=rx.color("gray", 2),
@@ -1033,6 +977,7 @@ def _results_view() -> rx.Component:
         ),
         rx.accordion.root(
             _section("Family & Domains", _domain_track(), "dom"),
+            _section("Mutations", _mutations_track(), "mut"),
             _section("Sequence", _sequence_view(), "seq"),
             _section(
                 "PDB 구조 " + State.structure_count.to_string() + "개",
@@ -1045,8 +990,9 @@ def _results_view() -> rx.Component:
                 ),
                 "pdb",
             ),
+            _section("Bioactivities (ChEMBL)", _drug_table(), "bio"),
             type="multiple",
-            default_value=["dom", "seq", "pdb"],
+            default_value=["dom", "mut", "seq", "pdb", "bio"],
             width="100%", variant="surface", radius="large",
         ),
         spacing="3", align="start", width="100%",
@@ -1061,194 +1007,6 @@ def index() -> rx.Component:
     return layout(builder_content())
 
 
-def _placeholder(title: str, desc: str) -> rx.Component:
-    return layout(
-        rx.vstack(
-            rx.heading(title, size="7"),
-            rx.callout(desc, icon="info"),
-            spacing="3", align="start",
-        )
-    )
-
-
-def _room_item(r: dict) -> rx.Component:
-    return rx.hstack(
-        rx.text(r["indent"]),
-        rx.button(r["title"], on_click=State.llm_select_room(r["id"], r["title"]),
-                  variant="ghost", size="2"),
-        rx.spacer(),
-        rx.button("🗑", on_click=State.llm_delete_room(r["id"]), variant="ghost", size="1"),
-        width="100%", spacing="1", align="center",
-    )
-
-
-def _msg_item(m: dict) -> rx.Component:
-    return rx.box(
-        rx.text(m["role"], size="1", color_scheme="gray", weight="bold"),
-        rx.markdown(m["content"]),
-        border="1px solid var(--gray-4)", border_radius="8px", padding="0.6rem",
-        width="100%",
-        background=rx.cond(m["role"] == "user", rx.color("accent", 2), rx.color("gray", 2)),
-    )
-
-
-def custom_llm_content() -> rx.Component:
-    return rx.hstack(
-        # 왼쪽: 방 트리
-        rx.vstack(
-            rx.heading("Custom LLM", size="6"),
-            rx.text("주제→소주제로 분화하는 트리 대화. LLM 이 PDB DB·논문분석을 조회해 답합니다.",
-                    color_scheme="gray", size="2"),
-            rx.hstack(
-                rx.input(value=State.llm_new_topic, on_change=State.set_llm_new_topic,
-                         placeholder="새 주제", width="170px"),
-                rx.button("＋주제", on_click=State.llm_create_topic),
-                spacing="1",
-            ),
-            rx.divider(),
-            rx.vstack(rx.foreach(State.llm_rooms, _room_item),
-                      spacing="1", width="100%", align="start"),
-            width="320px", align="start", spacing="2",
-            on_mount=State.llm_load_rooms,
-        ),
-        # 오른쪽: 대화
-        rx.cond(
-            State.llm_selected_room_id != 0,
-            rx.vstack(
-                rx.heading("💬 " + State.llm_selected_title, size="5"),
-                rx.hstack(
-                    rx.input(value=State.llm_branch_title, on_change=State.set_llm_branch_title,
-                             placeholder="이 방에서 분화할 소주제 제목", width="240px"),
-                    rx.button("↳ 분화", on_click=State.llm_branch, disabled=State.llm_busy),
-                    rx.button("⤴ 하위 통찰 종합", on_click=State.llm_rollup, disabled=State.llm_busy),
-                    spacing="2", wrap="wrap",
-                ),
-                rx.cond(State.llm_busy,
-                        rx.hstack(rx.spinner(), rx.text(State.llm_status), spacing="2")),
-                rx.cond((~State.llm_busy) & (State.llm_status != ""),
-                        rx.text(State.llm_status, size="2", color_scheme="gray")),
-                rx.vstack(rx.foreach(State.llm_messages, _msg_item), spacing="2", width="100%"),
-                rx.hstack(
-                    rx.input(value=State.llm_input, on_change=State.set_llm_input,
-                             placeholder="메시지 입력...", width="100%"),
-                    rx.button("전송", on_click=State.llm_send, disabled=State.llm_busy),
-                    width="100%", spacing="2",
-                ),
-                flex="1", align="start", spacing="3", width="100%",
-            ),
-            rx.center(
-                rx.text("왼쪽에서 주제/방을 선택하거나, 새 주제를 만드세요.", color_scheme="gray"),
-                flex="1", min_height="50vh",
-            ),
-        ),
-        align="start", spacing="4", width="100%",
-    )
-
-
-def analyzer_page() -> rx.Component:
-    return layout(custom_llm_content())
-
-
-def _search_result(r: dict) -> rx.Component:
-    return rx.box(
-        rx.hstack(
-            rx.badge(r["source_type"]),
-            rx.text(r["source_id"], weight="bold"),
-            rx.spacer(),
-            rx.text(r["score"]),
-            width="100%",
-        ),
-        rx.text(r["chunk_text"], size="2", color_scheme="gray"),
-        border="1px solid var(--gray-4)", border_radius="6px",
-        padding="0.5rem", width="100%",
-    )
-
-
-def _topic_item(t: dict) -> rx.Component:
-    return rx.button(
-        t["name"],
-        on_click=State.kb_select_topic(t["id"], t["name"]),
-        variant="soft", width="100%",
-    )
-
-
-def _link_item(l: dict) -> rx.Component:
-    return rx.text("• ", l["entity_type"], ": ", l["entity_id"], size="2")
-
-
-def _insight_item(ins: dict) -> rx.Component:
-    return rx.box(
-        rx.heading(ins["title"], size="3"),
-        rx.markdown(ins["body"]),
-        border="1px solid var(--gray-5)", border_radius="8px",
-        padding="0.75rem", width="100%",
-    )
-
-
-def _topic_detail() -> rx.Component:
-    return rx.cond(
-        State.kb_selected_topic_id != 0,
-        rx.vstack(
-            rx.heading("📌 " + State.kb_selected_topic_name, size="4"),
-            rx.hstack(
-                rx.select(
-                    ["protein", "structure", "paper"],
-                    value=State.kb_link_type, on_change=State.set_kb_link_type,
-                ),
-                rx.input(
-                    value=State.kb_link_id, on_change=State.set_kb_link_id,
-                    placeholder="ID (예: P08581 / 3CCN)", width="220px",
-                ),
-                rx.button("연결 추가", on_click=State.kb_add_link),
-            ),
-            rx.text("연결된 항목:", weight="bold"),
-            rx.vstack(rx.foreach(State.kb_links, _link_item), spacing="1", align="start"),
-            rx.button("🧠 종합 인사이트 생성", on_click=State.kb_synthesize, disabled=State.kb_busy),
-            rx.heading("인사이트", size="5"),
-            rx.vstack(rx.foreach(State.kb_insights, _insight_item), spacing="2", width="100%"),
-            spacing="2", align="start", flex="1",
-        ),
-    )
-
-
-def knowledge_content() -> rx.Component:
-    return rx.vstack(
-        rx.heading("Knowledge Base", size="7"),
-        rx.text("주제로 단백질·구조·논문을 묶고, LLM 종합 인사이트와 의미검색으로 지식을 누적합니다.",
-                color_scheme="gray"),
-        rx.heading("🔎 의미검색", size="4"),
-        rx.hstack(
-            rx.input(value=State.kb_search_query, on_change=State.set_kb_search_query,
-                     placeholder="예: MET DFG-out 저해제", width="360px"),
-            rx.button("검색", on_click=State.kb_search),
-            rx.button("재색인", on_click=State.kb_reindex, variant="outline"),
-        ),
-        rx.cond(State.kb_busy, rx.hstack(rx.spinner(), rx.text(State.kb_status), spacing="2")),
-        rx.cond((~State.kb_busy) & (State.kb_status != ""),
-                rx.text(State.kb_status, color_scheme="gray")),
-        rx.vstack(rx.foreach(State.kb_search_results, _search_result), width="100%", spacing="1"),
-        rx.divider(),
-        rx.heading("🧠 주제(Topic)", size="4"),
-        rx.hstack(
-            rx.input(value=State.kb_new_topic_name, on_change=State.set_kb_new_topic_name,
-                     placeholder="새 주제 이름", width="280px"),
-            rx.button("주제 생성", on_click=State.kb_create_topic),
-        ),
-        rx.hstack(
-            rx.vstack(rx.foreach(State.kb_topics, _topic_item),
-                      width="240px", spacing="1", align="start"),
-            _topic_detail(),
-            align="start", spacing="4", width="100%",
-        ),
-        spacing="3", align="start", width="100%",
-        on_mount=State.kb_load_topics,
-    )
-
-
-def knowledge_page() -> rx.Component:
-    return layout(knowledge_content())
-
-
 app = rx.App(
     theme=rx.theme(
         appearance="dark",
@@ -1260,5 +1018,3 @@ app = rx.App(
     stylesheets=["styles.css"],
 )
 app.add_page(index, route="/", title="PDB database")
-app.add_page(analyzer_page, route="/analyzer", title="Custom LLM")
-app.add_page(knowledge_page, route="/knowledge", title="Knowledge Base")
