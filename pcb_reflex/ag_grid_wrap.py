@@ -36,8 +36,11 @@ class AgGrid(rx.Component):
     on_row_clicked: rx.EventHandler[_clicked_row]
 
     def add_imports(self):
-        # v33 모듈/테마는 ag-grid-community 에서 import
-        return {"ag-grid-community": ["ModuleRegistry", "AllCommunityModule"]}
+        # v33 모듈/테마는 ag-grid-community 에서, createElement 는 react 에서 import
+        return {
+            "ag-grid-community": ["ModuleRegistry", "AllCommunityModule"],
+            "react": ["createElement"],
+        }
 
     def add_custom_code(self):
         # 모든 community 기능 등록 (정렬/필터/페이지네이션/테마 포함)
@@ -48,46 +51,45 @@ class AgGrid(rx.Component):
         ]
 
 
-# AG Grid 셀 렌더러 (raw JS) — params.data 의 dom_segs / cov_left / cov_width 를 읽어 막대 그림
+# AG Grid 셀 렌더러 (raw JS) — params.data 의 dom_segs / cov_left / cov_width 를 읽어 막대 그림.
+# ⚠️ ag-grid-react(React 버전)는 cellRenderer 반환값을 **React 노드**로 기대한다.
+#    DOM 엘리먼트(document.createElement)를 반환하면 "Objects are not valid as a React child"
+#    런타임 에러가 난다 → React.createElement 로 React 엘리먼트를 만들어 반환해야 한다.
 _PDB_COV_RENDERER_JS = """
 function pdbCovRenderer(params) {
   var d = params.data || {};
-  var wrap = document.createElement('div');
-  wrap.style.position = 'relative';
-  wrap.style.width = '100%';
-  wrap.style.height = '16px';
-  wrap.style.marginTop = '13px';
-  wrap.style.background = 'rgba(255,255,255,0.06)';
-  wrap.style.borderRadius = '3px';
+  var children = [];
   var segs = d.dom_segs || [];
   for (var i = 0; i < segs.length; i++) {
     var s = segs[i];
-    var dv = document.createElement('div');
-    dv.style.position = 'absolute';
-    dv.style.top = '0';
-    dv.style.height = '16px';
-    dv.style.left = s.left;
-    dv.style.width = s.width;
-    dv.style.background = s.color;
-    dv.style.opacity = '0.30';
-    dv.style.borderRadius = '2px';
-    dv.title = s.label || '';
-    wrap.appendChild(dv);
+    children.push(createElement('div', {
+      key: 'dom' + i,
+      title: s.label || '',
+      style: {
+        position: 'absolute', top: 0, height: '16px',
+        left: s.left, width: s.width,
+        background: s.color, opacity: 0.30, borderRadius: '2px'
+      }
+    }));
   }
   if (d.cov_width) {
-    var bar = document.createElement('div');
-    bar.style.position = 'absolute';
-    bar.style.top = '3px';
-    bar.style.height = '10px';
-    bar.style.left = d.cov_left;
-    bar.style.width = d.cov_width;
-    bar.style.background = 'var(--accent-9, #6b7cff)';
-    bar.style.borderRadius = '2px';
-    bar.style.boxShadow = '0 0 0 1px rgba(0,0,0,0.25)';
-    bar.title = (d.structure_id || '') + ': ' + (d.residue_range || '');
-    wrap.appendChild(bar);
+    children.push(createElement('div', {
+      key: 'cov',
+      title: (d.structure_id || '') + ': ' + (d.residue_range || ''),
+      style: {
+        position: 'absolute', top: '3px', height: '10px',
+        left: d.cov_left, width: d.cov_width,
+        background: 'var(--accent-9, #6b7cff)', borderRadius: '2px',
+        boxShadow: '0 0 0 1px rgba(0,0,0,0.25)'
+      }
+    }));
   }
-  return wrap;
+  return createElement('div', {
+    style: {
+      position: 'relative', width: '100%', height: '16px', marginTop: '13px',
+      background: 'rgba(255,255,255,0.06)', borderRadius: '3px'
+    }
+  }, children);
 }
 """
 
