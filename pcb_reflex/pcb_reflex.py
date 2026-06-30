@@ -148,10 +148,9 @@ class State(rx.State):
     upload_progress: int = 0
     has_pdf: bool = False   # 현재 PDB 에 저장된 PDF 있는지
 
-    # Feature Viewer (protein-level, 공유 좌표축 위 정렬 트랙)
+    # protein-level 개요 트랙 (변이 + 눈금자). 도메인·커버리지는 그리드 행 안으로 이동.
     mutation_track_items: list[dict] = []   # {left, color, mutation, position, label}
     ruler_ticks: list[dict] = []            # {left, label}
-    pdb_coverage_items: list[dict] = []     # {left, width, label} — 구조별 잔기 범위
 
     # 약물 테이블 (ChEMBL bioactivities summary)
     drug_rows: list[dict] = []
@@ -234,7 +233,13 @@ class State(rx.State):
         seq = load_sequence_from_file(p.get("sequence_path", "")) if p.get("sequence_path") else ""
         self.sequence_fmt = _format_sequence(seq)
 
-        # 구조 표 (+ KLIFS: DFG/αC/추정 타입)
+        denom = seq_len or 1390
+        # 도메인 세그먼트(배경 컨텍스트) — 모든 구조 행에 공통 첨부 (그리드 커버리지 셀 배경)
+        dom_segs = [{"left": d["left"], "width": d["width"],
+                     "color": d["color"], "label": d["label"]} for d in out]
+
+        # 구조 표 (+ KLIFS: DFG/αC/추정 타입 + 행 내 UniProt 커버리지 막대)
+        import re as _re
         structs = get_structures_by_uniprot(uid)
         sids = [s["structure_id"] for s in structs]
         mut_map = get_mutations_bulk(sids)
@@ -246,11 +251,28 @@ class State(rx.State):
             s["dfg"] = k.get("dfg") or "-"
             s["ac_helix"] = k.get("ac_helix") or "-"
             s["inhibitor_type"] = _inhibitor_type(k.get("dfg"), k.get("ac_helix"))
+            # 행 내 커버리지 막대 좌표 (residue_range → %)
+            s["dom_segs"] = dom_segs
+            s["cov_left"] = ""
+            s["cov_width"] = ""
+            rng = (s.get("residue_range") or "").strip()
+            if rng and rng not in ("-", "None"):
+                nums = _re.findall(r"\d+", rng)
+                if len(nums) >= 2:
+                    start, end = int(nums[-2]), int(nums[-1])
+                    if end >= start:
+                        cstart = min(max(start, 1), denom)
+                        cend = min(max(end, 1), denom)
+                        cl = (cstart - 1) / denom * 100
+                        cw = max(0.4, (cend - cstart + 1) / denom * 100)
+                        if cl + cw > 100:
+                            cw = 100 - cl
+                        s["cov_left"] = f"{cl:.2f}%"
+                        s["cov_width"] = f"{cw:.2f}%"
         self.structures = structs
 
         # 변이 트랙 — protein 전체 고유 변이 위치
         all_muts = get_all_mutations_by_uniprot(uid)
-        denom = seq_len or 1390
         seen_keys: set = set()
         track_items = []
         for m in all_muts:
@@ -280,32 +302,6 @@ class State(rx.State):
             ticks.append({"left": f"{(pos - 1) / denom * 100:.2f}%", "label": str(pos)})
             pos += step
         self.ruler_ticks = ticks
-
-        # PDB coverage 트랙 — 각 구조의 residue_range 를 같은 축에 막대로
-        cov = []
-        for s in structs:
-            rng = (s.get("residue_range") or "").strip()
-            start = end = None
-            if rng and rng not in ("-", "None"):
-                # "1-1390" / "P08581:1-1390" / "1–1390" 형태 방어적 파싱
-                import re as _re
-                nums = _re.findall(r"\d+", rng)
-                if len(nums) >= 2:
-                    start, end = int(nums[-2]), int(nums[-1])
-            if start is None or end is None or end < start:
-                continue
-            # 좌표 클램프 — 범위를 벗어난(저자번호 오염 등) 막대가 트랙 밖으로 튀지 않게
-            cstart = min(max(start, 1), denom)
-            cend = min(max(end, 1), denom)
-            left = (cstart - 1) / denom * 100
-            width = max(0.4, (cend - cstart + 1) / denom * 100)
-            if left + width > 100:
-                width = 100 - left
-            cov.append({
-                "left": f"{left:.2f}%", "width": f"{width:.2f}%",
-                "label": f"{s['structure_id']}: {start}-{end}",
-            })
-        self.pdb_coverage_items = cov
 
         # 약물 테이블 (compound_activity_summary — 데이터 없으면 빈 리스트)
         try:
@@ -640,20 +636,26 @@ class State(rx.State):
 # ═══════════════════════════════════════════
 # AG Grid 컬럼
 # ═══════════════════════════════════════════
+# 커버리지 컬럼: PDBe-KB 스타일 — 도메인(배경) + 구조 잔기범위 막대를 행 안에 직접 그림.
+# cellRenderer 는 raw JS 함수(pdbCovRenderer, ag_grid_wrap 에 주입)를 참조해야 하므로
+# column_defs 전체를 JS 배열 리터럴로 주입한다(아래 _COLUMN_DEFS_JS).
 _COLUMN_DEFS = [
     {"field": "structure_id", "headerName": "PDB ID", "pinned": "left", "filter": True,
-     "minWidth": 120},
-    {"field": "method", "headerName": "Method", "filter": True},
-    {"field": "resolution", "headerName": "Res (Å)", "filter": "agNumberColumnFilter", "maxWidth": 110},
+     "minWidth": 110, "maxWidth": 120},
+    {"headerName": "UniProt Coverage", "colId": "coverage", "cellRenderer": "__PDB_COV__",
+     "sortable": False, "filter": False, "minWidth": 240, "flex": 1,
+     "headerTooltip": "도메인(반투명 배경) + 이 구조가 커버하는 UniProt 잔기범위(막대). 막대 hover 시 범위 표시."},
+    {"field": "residue_range", "headerName": "Range", "filter": True, "maxWidth": 130},
+    {"field": "method", "headerName": "Method", "filter": True, "maxWidth": 110},
+    {"field": "resolution", "headerName": "Res (Å)", "filter": "agNumberColumnFilter", "maxWidth": 100},
     {"field": "complex_type", "headerName": "Complex", "filter": True},
     {"field": "inhibitor_type", "headerName": "Inhibitor type", "filter": True, "maxWidth": 130,
      "headerTooltip": "KLIFS DFG/αC 입체구조 기반 추정 (실험 분류 아님). 출처·근거: DATA_PROVENANCE.md §2"},
-    {"field": "dfg", "headerName": "DFG", "filter": True, "maxWidth": 90,
+    {"field": "dfg", "headerName": "DFG", "filter": True, "maxWidth": 85,
      "headerTooltip": "KLIFS (klifs.net) DFG motif in/out"},
-    {"field": "ac_helix", "headerName": "αC-helix", "filter": True, "maxWidth": 100,
+    {"field": "ac_helix", "headerName": "αC-helix", "filter": True, "maxWidth": 95,
      "headerTooltip": "KLIFS (klifs.net) αC-helix in/out"},
-    {"field": "chain_id", "headerName": "Chain", "filter": True, "maxWidth": 100},
-    {"field": "residue_range", "headerName": "Residue Range", "filter": True},
+    {"field": "chain_id", "headerName": "Chain", "filter": True, "maxWidth": 90},
     {"field": "mutations_str", "headerName": "Mutations", "filter": True},
     {"field": "expression_system", "headerName": "Organism", "filter": True},
     {"field": "host_cell_line", "headerName": "Expr System", "filter": True},
@@ -662,11 +664,17 @@ _COLUMN_DEFS = [
     {"field": "doi", "headerName": "DOI", "filter": True},
 ]
 
+# JS 배열 리터럴로 직렬화 후 placeholder 를 함수 참조로 치환 → raw JS Var 주입
+import json as _json
+_COLUMN_DEFS_JS = rx.Var(
+    _json.dumps(_COLUMN_DEFS, ensure_ascii=False).replace('"__PDB_COV__"', "pdbCovRenderer")
+)
+
 
 def _structures_grid() -> rx.Component:
     return rx.box(
         ag_grid(
-            column_defs=_COLUMN_DEFS,
+            column_defs=_COLUMN_DEFS_JS,
             row_data=State.structures,
             default_col_def={"sortable": True, "resizable": True, "floatingFilter": True},
             row_selection="single",
@@ -684,31 +692,7 @@ def _structures_grid() -> rx.Component:
 # Feature Viewer — 공유 좌표축(1D ruler) 위에 도메인·변이·PDB 트랙 정렬
 # (참조 이미지의 BACE1 Feature Viewer 레이아웃)
 # ═══════════════════════════════════════════
-_FV_LABEL_W = "132px"   # 좌측 트랙 라벨 열 너비
-
-
-def _fv_row(label: str, bar: rx.Component, sub: str = "") -> rx.Component:
-    """라벨 열 + 트랙 막대 한 줄."""
-    return rx.hstack(
-        rx.vstack(
-            rx.text(label, size="2", weight="bold", color=rx.color("gray", 12)),
-            rx.cond(sub != "", rx.text(sub, size="1", color=rx.color("gray", 9))),
-            spacing="0", align="start", width=_FV_LABEL_W, flex_shrink="0",
-        ),
-        rx.box(bar, flex="1", position="relative", min_width="0"),
-        width="100%", align="center", spacing="2",
-    )
-
-
 # 트랙 세그먼트 빌더 -------------------------------------------------
-def _domain_seg(d: dict) -> rx.Component:
-    return rx.tooltip(
-        rx.box(position="absolute", left=d["left"], width=d["width"],
-               top="0", height="22px", background=d["color"], border_radius="3px"),
-        content=d["label"],
-    )
-
-
 def _mut_pin(item: dict) -> rx.Component:
     return rx.tooltip(
         rx.box(
@@ -716,17 +700,6 @@ def _mut_pin(item: dict) -> rx.Component:
             width="2px", height="26px", background=item["color"], border_radius="1px",
         ),
         content=item["label"],
-    )
-
-
-def _cov_seg(c: dict) -> rx.Component:
-    return rx.tooltip(
-        rx.box(
-            position="absolute", left=c["left"], width=c["width"],
-            top="0", height="22px", background=rx.color("accent", 9),
-            opacity="0.22", border_radius="2px",
-        ),
-        content=c["label"],
     )
 
 
@@ -753,61 +726,55 @@ def _track_bar(children, height: str, bg=None) -> rx.Component:
     )
 
 
-def _feature_viewer() -> rx.Component:
-    """단백질 1D 좌표축 위에 Domains / Mutations / PDB Structures 트랙을 정렬."""
-    return rx.box(
-        rx.vstack(
-            # 눈금자 (라벨 열 비움)
-            rx.hstack(
-                rx.box(width=_FV_LABEL_W, flex_shrink="0"),
-                rx.box(
-                    rx.foreach(State.ruler_ticks, _ruler_tick),
-                    flex="1", position="relative", height="20px",
-                    min_width="0", overflow="visible",
-                ),
-                width="100%", spacing="2",
-            ),
-            # Domains
-            _fv_row(
-                "Domains",
-                _track_bar(rx.foreach(State.domains, _domain_seg), "22px",
-                           bg=rx.color("gray", 3)),
-            ),
-            # Mutations
-            _fv_row(
-                "Mutations",
-                _track_bar(rx.foreach(State.mutation_track_items, _mut_pin), "26px",
-                           bg=rx.color("gray", 3)),
-                sub=State.mutation_count.to_string() + " sites",
-            ),
-            # PDB Structures coverage
-            _fv_row(
-                "PDB Structures",
-                _track_bar(rx.foreach(State.pdb_coverage_items, _cov_seg), "22px",
-                           bg=rx.color("gray", 3)),
-                sub=State.structure_count.to_string() + " 구조",
-            ),
-            spacing="3", width="100%", align="start",
-        ),
-        border="1px solid var(--gray-5)", border_radius="16px",
-        padding="1.1rem 1.25rem", width="100%",
-        background=rx.color("gray", 2),
-    )
-
-
 def _domain_legend() -> rx.Component:
-    """도메인 색상 범례 (Feature Viewer 아래 보조)."""
+    """도메인 색상 범례 — 그리드 커버리지 셀의 배경 색상을 해독."""
     def _row(d: dict) -> rx.Component:
         return rx.hstack(
-            rx.box(width="10px", height="10px", background=d["color"], border_radius="2px"),
+            rx.box(width="10px", height="10px", background=d["color"],
+                   opacity="0.55", border_radius="2px"),
             rx.text(d["name"], size="1", weight="medium"),
             rx.text(d["range"], size="1", color_scheme="gray"),
             spacing="1", align="center",
         )
     return rx.cond(
         State.domains.length() > 0,
-        rx.hstack(rx.foreach(State.domains, _row), wrap="wrap", spacing="3",
-                  width="100%", padding_top="0.25rem"),
+        rx.hstack(
+            rx.text("Domains:", size="1", weight="bold", color=rx.color("gray", 10)),
+            rx.foreach(State.domains, _row),
+            wrap="wrap", spacing="3", width="100%", align="center",
+        ),
+    )
+
+
+def _protein_overview() -> rx.Component:
+    """그리드 위 단백질 단위 개요 — 눈금자 + 변이 트랙 + 도메인 범례.
+
+    도메인·구조 커버리지는 이제 그리드 각 행 안(UniProt Coverage 컬럼)에 표시되므로,
+    여기서는 행 단위로 못 보여주는 protein-level 정보(변이 집계)만 둔다.
+    """
+    return rx.box(
+        rx.vstack(
+            _domain_legend(),
+            rx.cond(
+                State.mutation_count > 0,
+                rx.vstack(
+                    rx.box(
+                        rx.foreach(State.ruler_ticks, _ruler_tick),
+                        position="relative", width="100%", height="20px",
+                        min_width="0", overflow="visible",
+                    ),
+                    _track_bar(rx.foreach(State.mutation_track_items, _mut_pin), "26px",
+                               bg=rx.color("gray", 3)),
+                    rx.text("Mutations · " + State.mutation_count.to_string() + " sites "
+                            "(전체 구조 합산, UniProt 좌표)",
+                            size="1", color=rx.color("gray", 9)),
+                    spacing="1", width="100%", align="start",
+                ),
+            ),
+            spacing="3", width="100%", align="start",
+        ),
+        border="1px solid var(--gray-5)", border_radius="16px",
+        padding="1rem 1.25rem", width="100%", background=rx.color("gray", 2),
     )
 
 
@@ -1194,21 +1161,20 @@ def _top_bar() -> rx.Component:
 
 def _structures_tab() -> rx.Component:
     return rx.vstack(
-        rx.text("표에서 PDB 행을 클릭하면 아래에 세부정보 + 논문 분석이 나타납니다.",
+        _protein_overview(),
+        rx.text("각 행의 'UniProt Coverage' 열은 도메인(반투명 배경) 위에 그 구조가 커버하는 "
+                "잔기범위(막대)를 표시합니다. 행을 클릭하면 아래에 세부정보 + 논문 분석이 나타납니다.",
                 color_scheme="gray", size="2"),
         _structures_grid(),
         _pdb_detail_panel(),
-        spacing="2", width="100%", align="start",
+        spacing="3", width="100%", align="start",
     )
 
 
 def _results_view() -> rx.Component:
     return rx.vstack(
         _top_bar(),
-        # ── 공유 좌표축 Feature Viewer (항상 표시 = 유기적 통합의 척추) ──
-        _feature_viewer(),
-        _domain_legend(),
-        # ── 데이터 축별 탭 (Feature Viewer 아래, 같은 프레임) ──
+        # ── 데이터 축별 탭 (도메인·커버리지는 PDB 구조 탭의 그리드 행 안에 통합) ──
         rx.tabs.root(
             rx.tabs.list(
                 rx.tabs.trigger(
