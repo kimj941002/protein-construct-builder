@@ -628,6 +628,69 @@ def upsert_bioactivity(data: dict):
         })
 
 
+def upsert_compounds_bulk(records: list[dict]):
+    """compounds 다건 upsert — 단일 트랜잭션(executemany). 원격 DB 왕복 최소화."""
+    if not records:
+        return
+    rows = [{
+        "chembl_id":        r.get("chembl_id"),
+        "pref_name":        r.get("pref_name"),
+        "canonical_smiles": r.get("canonical_smiles"),
+        "inchikey":         r.get("inchikey"),
+        "max_phase":        r.get("max_phase"),
+    } for r in records if r.get("chembl_id")]
+    if not rows:
+        return
+    with get_engine().begin() as conn:
+        conn.execute(text("""
+            INSERT INTO compounds (chembl_id, pref_name, canonical_smiles, inchikey, max_phase)
+            VALUES (:chembl_id, :pref_name, :canonical_smiles, :inchikey, :max_phase)
+            ON CONFLICT (chembl_id) DO UPDATE SET
+                pref_name        = COALESCE(EXCLUDED.pref_name, compounds.pref_name),
+                canonical_smiles = COALESCE(EXCLUDED.canonical_smiles, compounds.canonical_smiles),
+                inchikey         = COALESCE(EXCLUDED.inchikey, compounds.inchikey),
+                max_phase        = COALESCE(EXCLUDED.max_phase, compounds.max_phase)
+        """), rows)
+
+
+def upsert_bioactivities_bulk(records: list[dict]):
+    """bioactivities 다건 upsert — 단일 트랜잭션(executemany)."""
+    if not records:
+        return
+    rows = [{
+        "chembl_id":           r.get("chembl_id"),
+        "uniprot_acc":         r.get("uniprot_acc"),
+        "standard_type":       r.get("standard_type"),
+        "standard_value":      r.get("standard_value"),
+        "standard_units":      r.get("standard_units"),
+        "value_nM_normalized": r.get("value_nM_normalized"),
+        "pchembl_value":       r.get("pchembl_value"),
+        "assay_chembl_id":     r.get("assay_chembl_id") or "",
+        "assay_description":   r.get("assay_description"),
+        "document_chembl_id":  r.get("document_chembl_id"),
+    } for r in records if r.get("chembl_id")]
+    if not rows:
+        return
+    with get_engine().begin() as conn:
+        conn.execute(text("""
+            INSERT INTO bioactivities
+                (chembl_id, uniprot_acc, standard_type, standard_value, standard_units,
+                 value_nM_normalized, pchembl_value, assay_chembl_id, assay_description,
+                 document_chembl_id)
+            VALUES
+                (:chembl_id, :uniprot_acc, :standard_type, :standard_value, :standard_units,
+                 :value_nM_normalized, :pchembl_value, :assay_chembl_id, :assay_description,
+                 :document_chembl_id)
+            ON CONFLICT (chembl_id, uniprot_acc, assay_chembl_id, standard_type) DO UPDATE SET
+                standard_value      = EXCLUDED.standard_value,
+                standard_units      = EXCLUDED.standard_units,
+                value_nM_normalized = EXCLUDED.value_nM_normalized,
+                pchembl_value       = EXCLUDED.pchembl_value,
+                assay_description   = EXCLUDED.assay_description,
+                document_chembl_id  = EXCLUDED.document_chembl_id
+        """), rows)
+
+
 def get_all_mutations_by_uniprot(uniprot_id: str) -> list[dict]:
     """UniProt 단백질 전체 구조에 걸쳐 고유 변이 목록 반환 (mutations track 용)."""
     with get_engine().connect() as conn:

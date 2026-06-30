@@ -270,7 +270,9 @@ CREATE TABLE IF NOT EXISTS compounds (
     inchikey         TEXT,
     max_phase        NUMERIC   -- ChEMBL max_phase 는 0.5/4.0 등 소수 가능
 );
--- 이전 버전(INTEGER)으로 이미 생성된 경우 타입 보정 (멱등)
+-- 이전 버전(INTEGER)으로 이미 생성된 경우 타입 보정 (멱등).
+-- compound_activity_summary 뷰가 max_phase 에 의존하므로 뷰를 먼저 제거 후 ALTER (뷰는 아래에서 재생성).
+DROP VIEW IF EXISTS compound_activity_summary;
 ALTER TABLE compounds ALTER COLUMN max_phase TYPE NUMERIC USING max_phase::numeric;
 
 -- ── compound_synonyms ── 동의어 (임상명·INN·코드명)

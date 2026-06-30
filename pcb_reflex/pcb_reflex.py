@@ -786,7 +786,7 @@ _DRUG_COLUMN_DEFS = [
      "headerTooltip": "최고 임상 단계 (ChEMBL max_phase)"},
     {"field": "median_pchembl", "headerName": "Median pChEMBL",  "filter": "agNumberColumnFilter",
      "maxWidth": 150, "headerTooltip": "여러 어세이의 중앙값 pChEMBL (−log₁₀ 몰 농도)"},
-    {"field": "best_nM",        "headerName": "Best (nM)",       "filter": "agNumberColumnFilter",
+    {"field": "best_nm",        "headerName": "Best (nM)",       "filter": "agNumberColumnFilter",
      "maxWidth": 120, "headerTooltip": "농도 단위 어세이 중 최저 IC50/Ki (nM)"},
     {"field": "n_records",      "headerName": "# Assays",        "filter": "agNumberColumnFilter",
      "maxWidth": 110},
