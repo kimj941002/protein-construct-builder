@@ -268,8 +268,10 @@ CREATE TABLE IF NOT EXISTS compounds (
     pref_name        TEXT,
     canonical_smiles TEXT,
     inchikey         TEXT,
-    max_phase        INTEGER
+    max_phase        NUMERIC   -- ChEMBL max_phase 는 0.5/4.0 등 소수 가능
 );
+-- 이전 버전(INTEGER)으로 이미 생성된 경우 타입 보정 (멱등)
+ALTER TABLE compounds ALTER COLUMN max_phase TYPE NUMERIC USING max_phase::numeric;
 
 -- ── compound_synonyms ── 동의어 (임상명·INN·코드명)
 CREATE TABLE IF NOT EXISTS compound_synonyms (

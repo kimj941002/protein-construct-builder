@@ -53,6 +53,16 @@ def _normalize_nM(value: float | None, units: str | None) -> float | None:
     return value * factor
 
 
+def _to_num(v) -> float | None:
+    """ChEMBL 이 '2.0'·'4.0' 같은 문자열로 주는 수치를 float 로 안전 변환."""
+    if v is None:
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
 # ── ChEMBL target lookup ────────────────────────────────────
 def get_target_chembl_id(uniprot_acc: str) -> str | None:
     """UniProt accession → ChEMBL target ChEMBL ID 조회."""
@@ -150,7 +160,7 @@ def run(uniprot_acc: str = UNIPROT_ACC) -> dict:
             "pref_name":        info.get("pref_name"),
             "canonical_smiles": (info.get("molecule_structures") or {}).get("canonical_smiles"),
             "inchikey":         (info.get("molecule_structures") or {}).get("standard_inchi_key"),
-            "max_phase":        info.get("max_phase"),
+            "max_phase":        _to_num(info.get("max_phase")),
         }
         try:
             upsert_compound(record)

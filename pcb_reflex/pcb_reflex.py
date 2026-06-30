@@ -155,6 +155,8 @@ class State(rx.State):
 
     # 약물 테이블 (ChEMBL bioactivities summary)
     drug_rows: list[dict] = []
+    chembl_busy: bool = False
+    chembl_status: str = ""
 
     # 논문 (단백질 단위 통합)
     paper_rows: list[dict] = []             # papers 테이블
@@ -404,13 +406,51 @@ class State(rx.State):
             self.structures = []
             self.selected_structure_ids = []
         uid = await asyncio.to_thread(self._resolve_or_collect, q)
+        need_chembl = False
         async with self:
             self.collecting = False
             self.collect_status = ""
             if uid:
                 self._apply_protein(uid)
+                need_chembl = not self.drug_rows   # 활성 데이터 없으면 자동 수집
             else:
                 self.not_found = True
+        if need_chembl:
+            return State.fetch_chembl
+
+    def _do_chembl(self, uid: str) -> dict:
+        """(스레드) ChEMBL 활성 데이터 수집. chembl_fetcher.run 재사용."""
+        try:
+            from chembl_fetcher import run as chembl_run
+            return chembl_run(uid)
+        except Exception as e:
+            return {"error": f"{type(e).__name__}: {str(e)[:160]}"}
+
+    @rx.event(background=True)
+    async def fetch_chembl(self):
+        """검색한 단백질의 ChEMBL 활성 데이터를 백그라운드로 수집 → 약물 테이블 갱신."""
+        async with self:
+            uid = self.selected_uid
+            if not uid or self.chembl_busy:
+                return
+            self.chembl_busy = True
+            self.chembl_status = "ChEMBL 활성 데이터 수집 중... (수 분 소요될 수 있음)"
+        res = await asyncio.to_thread(self._do_chembl, uid)
+        async with self:
+            self.chembl_busy = False
+            if res.get("error"):
+                self.chembl_status = "수집 실패: " + res["error"]
+            else:
+                try:
+                    self.drug_rows = get_drug_table_by_uniprot(uid)
+                except Exception:
+                    self.drug_rows = []
+                n_c = res.get("compounds", 0)
+                n_b = res.get("bioactivities", 0)
+                if n_c == 0 and n_b == 0:
+                    self.chembl_status = "이 단백질의 ChEMBL 활성 데이터가 없습니다 (비키나아제·미등록 가능)."
+                else:
+                    self.chembl_status = f"수집 완료 — 약물 {n_c}개 · 활성 {n_b}건"
 
     @rx.event
     def on_select_structures(self, rows: list[dict]):
@@ -787,25 +827,42 @@ _DRUG_COLUMN_DEFS = [
 
 
 def _drug_table() -> rx.Component:
-    return rx.cond(
-        State.drug_rows.length() > 0,
-        rx.box(
-            ag_grid(
-                column_defs=_DRUG_COLUMN_DEFS,
-                row_data=State.drug_rows,
-                default_col_def={"sortable": True, "resizable": True, "floatingFilter": True},
-                pagination=True,
-                pagination_page_size=20,
+    return rx.vstack(
+        rx.hstack(
+            rx.button(
+                rx.cond(State.chembl_busy, rx.spinner(), rx.icon("download", size=14)),
+                "ChEMBL 활성 데이터 가져오기/갱신",
+                on_click=State.fetch_chembl, disabled=State.chembl_busy, size="2",
+                variant="soft",
             ),
-            width="100%",
-            height="400px",
-            custom_attrs={"data-ag-theme-mode": "dark"},
+            rx.cond(State.chembl_status != "",
+                    rx.text(State.chembl_status, size="1", color=rx.color("gray", 10))),
+            align="center", spacing="3", width="100%", wrap="wrap",
         ),
-        rx.callout(
-            "ChEMBL 데이터 없음 — 터미널에서 python chembl_fetcher.py 를 실행하세요.",
-            icon="info",
-            color_scheme="gray",
+        rx.cond(
+            State.drug_rows.length() > 0,
+            rx.box(
+                ag_grid(
+                    column_defs=_DRUG_COLUMN_DEFS,
+                    row_data=State.drug_rows,
+                    default_col_def={"sortable": True, "resizable": True, "floatingFilter": True},
+                    pagination=True,
+                    pagination_page_size=20,
+                ),
+                width="100%",
+                height="400px",
+                custom_attrs={"data-ag-theme-mode": "dark"},
+            ),
+            rx.cond(
+                ~State.chembl_busy,
+                rx.callout(
+                    "아직 ChEMBL 활성 데이터가 없습니다. 단백질 검색 시 자동 수집되며, "
+                    "위 버튼으로 직접 갱신할 수도 있습니다.",
+                    icon="info", color_scheme="gray",
+                ),
+            ),
         ),
+        spacing="3", width="100%", align="start",
     )
 
 
