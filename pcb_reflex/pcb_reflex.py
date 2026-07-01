@@ -1426,13 +1426,16 @@ def index() -> rx.Component:
 
 
 app = rx.App(
-    theme=rx.theme(
-        appearance="dark",
-        accent_color="gray",     # 무채색(중성) — CSS 로 톤 보정
-        gray_color="slate",
-        radius="large",
-        scaling="100%",
-    ),
+    # theme 은 rxconfig.py 의 RadixThemesPlugin 에서 설정(appearance="dark").
     stylesheets=["styles.css"],
+    # ★다크 강제: 배포(prod) 빌드는 next-themes 가 localStorage["theme"] 또는 시스템
+    #  설정을 따라가 라이트로 뒤집히는 문제가 있었다(집=다크OS 정상, 회사=라이트OS 흰 박스).
+    #  하이드레이션 전에 localStorage 를 dark 로 고정해 항상 다크로 resolve 되게 한다.
+    head_components=[
+        rx.script(
+            "try{window.localStorage.setItem('theme','dark');"
+            "document.documentElement.classList.add('dark');}catch(e){}"
+        ),
+    ],
 )
 app.add_page(index, route="/", title="PDB database")
