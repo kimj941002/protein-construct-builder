@@ -169,6 +169,9 @@ class State(rx.State):
     upload_progress: int = 0
     has_pdf: bool = False   # 현재 PDB 에 저장된 PDF 있는지
 
+    # 활성 탭 (축 간 이동 시 제어 — 유기적 연결)
+    active_tab: str = "pdb"
+
     # protein-level 개요 트랙 (변이 + 눈금자). 도메인·커버리지는 그리드 행 안으로 이동.
     mutation_track_items: list[dict] = []   # {left, color, mutation, position, label}
     ruler_ticks: list[dict] = []            # {left, label}
@@ -523,7 +526,9 @@ class State(rx.State):
     @rx.event
     def on_drug_clicked(self, row: dict):
         """약물 행 클릭 → 상세(임상단계·승인·질환·결합 PDB) 로드 (Synapse식 연결)."""
-        cid = row.get("chembl_id")
+        self._load_drug(row.get("chembl_id"))
+
+    def _load_drug(self, cid: str | None):
         if not cid:
             return
         self.selected_drug_id = cid
@@ -550,10 +555,22 @@ class State(rx.State):
             self.drug_structures = []
 
     @rx.event
+    def set_active_tab(self, tab: str):
+        self.active_tab = tab
+
+    @rx.event
+    def open_drug_from_structure(self, chembl_id: str):
+        """PDB 세부의 결합 약물 클릭 → 약물 탭으로 전환 + 약물 상세 로드 (역방향 연결)."""
+        if chembl_id:
+            self._load_drug(chembl_id)
+            self.active_tab = "bio"
+
+    @rx.event
     def open_structure_from_drug(self, sid: str):
-        """약물 상세의 결합 PDB 클릭 → 구조 세부 로드 (축 간 이동)."""
+        """약물 상세의 결합 PDB 클릭 → PDB 구조 탭으로 전환 + 구조 세부 로드 (축 간 이동)."""
         if sid:
             self._load_detail(sid)
+            self.active_tab = "pdb"
 
     @rx.event
     def toggle_drugs_only(self, val: bool):
@@ -1126,10 +1143,11 @@ def _lig_item(l: dict) -> rx.Component:
 
 
 def _bound_drug_item(d: dict) -> rx.Component:
-    """PDB 세부 패널의 결합 약물 한 줄 — 리간드·약물명·임상단계·ChEMBL 링크."""
+    """PDB 세부 패널의 결합 약물 한 줄 — 리간드·약물명(클릭→약물탭)·임상단계·ChEMBL 링크."""
     return rx.hstack(
         rx.badge(d["ligand_id"], variant="soft", color_scheme="gray", size="1"),
-        rx.text(d["pref_name"], size="2", weight="bold"),
+        rx.button(d["pref_name"], on_click=State.open_drug_from_structure(d["chembl_id"]),
+                  variant="ghost", size="1", weight="bold"),
         rx.badge(d["phase_label"], color_scheme="jade", variant="soft", size="1"),
         rx.link("↗", href=d["chembl_url"], is_external=True, size="1"),
         spacing="2", align="center", wrap="wrap",
@@ -1393,7 +1411,7 @@ def _results_view() -> rx.Component:
             rx.tabs.content(_drug_table(), value="bio", padding_top="1rem"),
             rx.tabs.content(_papers_view(), value="papers", padding_top="1rem"),
             rx.tabs.content(_sequence_view(), value="seq", padding_top="1rem"),
-            default_value="pdb", width="100%",
+            value=State.active_tab, on_change=State.set_active_tab, width="100%",
         ),
         spacing="4", align="start", width="100%",
     )
