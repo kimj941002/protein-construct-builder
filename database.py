@@ -652,18 +652,26 @@ def upsert_compounds_bulk(records: list[dict]):
         "canonical_smiles": r.get("canonical_smiles"),
         "inchikey":         r.get("inchikey"),
         "max_phase":        r.get("max_phase"),
+        "first_approval":   r.get("first_approval"),
+        "molecule_type":    r.get("molecule_type"),
     } for r in records if r.get("chembl_id")]
     if not rows:
         return
     with get_engine().begin() as conn:
         conn.execute(text("""
-            INSERT INTO compounds (chembl_id, pref_name, canonical_smiles, inchikey, max_phase)
-            VALUES (:chembl_id, :pref_name, :canonical_smiles, :inchikey, :max_phase)
+            INSERT INTO compounds
+                (chembl_id, pref_name, canonical_smiles, inchikey, max_phase,
+                 first_approval, molecule_type)
+            VALUES
+                (:chembl_id, :pref_name, :canonical_smiles, :inchikey, :max_phase,
+                 :first_approval, :molecule_type)
             ON CONFLICT (chembl_id) DO UPDATE SET
                 pref_name        = COALESCE(EXCLUDED.pref_name, compounds.pref_name),
                 canonical_smiles = COALESCE(EXCLUDED.canonical_smiles, compounds.canonical_smiles),
                 inchikey         = COALESCE(EXCLUDED.inchikey, compounds.inchikey),
-                max_phase        = COALESCE(EXCLUDED.max_phase, compounds.max_phase)
+                max_phase        = COALESCE(EXCLUDED.max_phase, compounds.max_phase),
+                first_approval   = COALESCE(EXCLUDED.first_approval, compounds.first_approval),
+                molecule_type    = COALESCE(EXCLUDED.molecule_type, compounds.molecule_type)
         """), rows)
 
 
@@ -761,6 +769,77 @@ def get_drug_table_with_links(uniprot_id: str) -> list[dict]:
     return _jsonable(rows)
 
 
+def get_clinical_drugs_by_uniprot(uniprot_id: str, drugs_only: bool = True) -> list[dict]:
+    """이 단백질의 약물 테이블 — 임상단계 + 결합 PDB 중심 (IC50/활성 제외).
+
+    drugs_only=True: 임상단계(max_phase) 있거나 결합 PDB 있는 '진짜 약물'만.
+    drugs_only=False: MET 활성 화합물 전체 (연구화합물 포함).
+    각 행: chembl_id, drug_name(무명은 ChEMBL ID), max_phase, first_approval,
+           molecule_type, n_pdb, top_indication.
+    """
+    where = "WHERE (c.max_phase IS NOT NULL OR pc.n_pdb > 0)" if drugs_only else "WHERE TRUE"
+    with get_engine().connect() as conn:
+        rows = conn.execute(text(f"""
+            SELECT c.chembl_id,
+                   COALESCE(NULLIF(c.pref_name, ''), c.chembl_id) AS drug_name,
+                   (c.pref_name IS NOT NULL AND c.pref_name <> '') AS is_named,
+                   c.max_phase, c.first_approval, c.molecule_type,
+                   COALESCE(pc.n_pdb, 0) AS n_pdb,
+                   ind.top_indication
+            FROM compounds c
+            JOIN (SELECT DISTINCT chembl_id FROM bioactivities WHERE uniprot_acc = :uid) b
+                 ON b.chembl_id = c.chembl_id
+            LEFT JOIN (
+                SELECT m.chembl_id, count(DISTINCT l.structure_id) AS n_pdb
+                FROM ligand_chembl_map m
+                JOIN ligands l ON l.ligand_id = m.ligand_id
+                JOIN pdb_structures p ON p.structure_id = l.structure_id
+                WHERE m.chembl_id IS NOT NULL AND p.uniprot_id = :uid
+                GROUP BY m.chembl_id
+            ) pc ON pc.chembl_id = c.chembl_id
+            LEFT JOIN (
+                SELECT DISTINCT ON (chembl_id) chembl_id,
+                       mesh_heading AS top_indication
+                FROM drug_indications
+                ORDER BY chembl_id, max_phase_for_ind DESC NULLS LAST
+            ) ind ON ind.chembl_id = c.chembl_id
+            {where}
+            ORDER BY c.max_phase DESC NULLS LAST, pc.n_pdb DESC NULLS LAST, c.pref_name NULLS LAST
+        """), {"uid": uniprot_id}).mappings().all()
+    return _jsonable(rows)
+
+
+def get_drug_indications(chembl_id: str) -> list[dict]:
+    """약물의 질환 indication 목록 (최고 단계순)."""
+    with get_engine().connect() as conn:
+        rows = conn.execute(text("""
+            SELECT mesh_heading, max_phase_for_ind
+            FROM drug_indications WHERE chembl_id = :cid
+            ORDER BY max_phase_for_ind DESC NULLS LAST, mesh_heading
+        """), {"cid": chembl_id}).mappings().all()
+    return _jsonable(rows)
+
+
+def upsert_drug_indications_bulk(records: list[dict]):
+    """drug_indications 다건 upsert (단일 트랜잭션)."""
+    rows = [{
+        "chembl_id": r.get("chembl_id"),
+        "mesh_heading": r.get("mesh_heading"),
+        "max_phase_for_ind": r.get("max_phase_for_ind"),
+        "efo_term": r.get("efo_term"),
+    } for r in records if r.get("chembl_id") and r.get("mesh_heading")]
+    if not rows:
+        return
+    with get_engine().begin() as conn:
+        conn.execute(text("""
+            INSERT INTO drug_indications (chembl_id, mesh_heading, max_phase_for_ind, efo_term)
+            VALUES (:chembl_id, :mesh_heading, :max_phase_for_ind, :efo_term)
+            ON CONFLICT (chembl_id, mesh_heading) DO UPDATE SET
+                max_phase_for_ind = EXCLUDED.max_phase_for_ind,
+                efo_term = EXCLUDED.efo_term
+        """), rows)
+
+
 def get_structures_for_drug(chembl_id: str, uniprot_id: str) -> list[dict]:
     """이 약물(ChEMBL)의 리간드가 결합한 이 단백질의 PDB 구조 목록."""
     with get_engine().connect() as conn:
@@ -793,29 +872,20 @@ def get_drugs_for_structure(structure_id: str) -> list[dict]:
 
 
 def get_drug_detail(chembl_id: str, uniprot_id: str) -> dict:
-    """약물 1개의 상세 — 화합물 메타 + 활성 요약 + assay 표본."""
+    """약물 1개의 상세 — 화합물·임상 메타 + 질환 indications (활성/IC50 제외)."""
     with get_engine().connect() as conn:
         comp = conn.execute(text(
-            "SELECT chembl_id, pref_name, canonical_smiles, inchikey, max_phase "
+            "SELECT chembl_id, pref_name, max_phase, first_approval, molecule_type "
             "FROM compounds WHERE chembl_id = :cid"
         ), {"cid": chembl_id}).mappings().first()
-        summ = conn.execute(text(
-            "SELECT ROUND(median_pchembl::numeric,2) AS median_pchembl, n_records, "
-            "ROUND(best_nM::numeric,1) AS best_nm "
-            "FROM compound_activity_summary WHERE chembl_id = :cid AND uniprot_acc = :uid"
-        ), {"cid": chembl_id, "uid": uniprot_id}).mappings().first()
-        assays = conn.execute(text("""
-            SELECT standard_type, standard_value, standard_units,
-                   ROUND(pchembl_value::numeric, 2) AS pchembl_value, assay_description
-            FROM bioactivities
-            WHERE chembl_id = :cid AND uniprot_acc = :uid AND pchembl_value IS NOT NULL
-            ORDER BY pchembl_value DESC NULLS LAST
-            LIMIT 12
-        """), {"cid": chembl_id, "uid": uniprot_id}).mappings().all()
+        inds = conn.execute(text("""
+            SELECT mesh_heading, max_phase_for_ind
+            FROM drug_indications WHERE chembl_id = :cid
+            ORDER BY max_phase_for_ind DESC NULLS LAST, mesh_heading
+        """), {"cid": chembl_id}).mappings().all()
     return {
         "compound": _jsonable([comp])[0] if comp else {},
-        "summary": _jsonable([summ])[0] if summ else {},
-        "assays": _jsonable(assays),
+        "indications": _jsonable(inds),
     }
 
 

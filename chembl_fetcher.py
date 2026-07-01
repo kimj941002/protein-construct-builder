@@ -22,7 +22,11 @@ import time
 import requests
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from database import upsert_compounds_bulk, upsert_bioactivities_bulk
+from database import (
+    upsert_compounds_bulk,
+    upsert_bioactivities_bulk,
+    upsert_drug_indications_bulk,
+)
 
 CHEMBL_BASE = "https://www.ebi.ac.uk/chembl/api/data"
 UNIPROT_ACC  = "P08581"
@@ -142,13 +146,45 @@ def fetch_molecule_meta(chembl_ids: list[str]) -> dict[str, dict]:
                 continue
             ms = m.get("molecule_structures") or {}
             meta[cid] = {
-                "inchikey":  ms.get("standard_inchi_key"),
-                "max_phase": _to_num(m.get("max_phase")),
-                "pref_name": m.get("pref_name"),
+                "inchikey":       ms.get("standard_inchi_key"),
+                "max_phase":      _to_num(m.get("max_phase")),
+                "pref_name":      m.get("pref_name"),
+                "first_approval": m.get("first_approval"),
+                "molecule_type":  m.get("molecule_type"),
             }
         print(f"  molecule 메타 {min(ci+CHUNK, len(chembl_ids))}/{len(chembl_ids)} (chunk {ci//CHUNK+1}/{total_chunks})")
         time.sleep(0.2)
     return meta
+
+
+def fetch_drug_indications(chembl_ids: list[str]) -> list[dict]:
+    """임상 약물의 질환 indication 을 drug_indication 엔드포인트에서 벌크 수집.
+
+    임상 개발 대상 질환(Synapse Indication 축). 임상단계 있는 약물만 대상으로 호출량 절약.
+    """
+    out = []
+    CHUNK = 30
+    for ci in range(0, len(chembl_ids), CHUNK):
+        chunk = chembl_ids[ci:ci + CHUNK]
+        url = (f"{CHEMBL_BASE}/drug_indication"
+               f"?molecule_chembl_id__in={','.join(chunk)}"
+               f"&format=json&limit=1000")
+        try:
+            resp = requests.get(url, timeout=REQUEST_TIMEOUT)
+            resp.raise_for_status()
+            inds = resp.json().get("drug_indications", [])
+        except Exception as e:
+            print(f"[WARN] drug_indication 조회 실패 (chunk {ci//CHUNK+1}): {e}")
+            continue
+        for d in inds:
+            out.append({
+                "chembl_id":         d.get("molecule_chembl_id"),
+                "mesh_heading":      d.get("mesh_heading"),
+                "max_phase_for_ind": _to_num(d.get("max_phase_for_ind")),
+                "efo_term":          (d.get("efo_term") or None),
+            })
+        time.sleep(0.2)
+    return out
 
 
 # ── 메인 실행 ───────────────────────────────────────────────
@@ -181,15 +217,19 @@ def run(uniprot_acc: str = UNIPROT_ACC) -> dict:
             "canonical_smiles": a.get("canonical_smiles"),
             "inchikey":         None,    # molecule 벌크로 보강
             "max_phase":        None,
+            "first_approval":   None,
+            "molecule_type":    None,
         }
-    print(f"[INFO] {len(compounds)} 고유 화합물 — inchikey·max_phase 벌크 보강 중...")
+    print(f"[INFO] {len(compounds)} 고유 화합물 — 메타(inchikey·임상단계·승인·타입) 벌크 보강 중...")
 
-    # 4. inchikey·max_phase 벌크 보강
+    # 4. inchikey·max_phase·first_approval·molecule_type 벌크 보강
     meta = fetch_molecule_meta(list(compounds.keys()))
     for cid, mt in meta.items():
         if cid in compounds:
             compounds[cid]["inchikey"] = mt.get("inchikey")
             compounds[cid]["max_phase"] = mt.get("max_phase")
+            compounds[cid]["first_approval"] = mt.get("first_approval")
+            compounds[cid]["molecule_type"] = mt.get("molecule_type")
             if not compounds[cid]["pref_name"]:
                 compounds[cid]["pref_name"] = mt.get("pref_name")
 
@@ -246,7 +286,21 @@ def run(uniprot_acc: str = UNIPROT_ACC) -> dict:
                 "error": f"bioactivity_bulk_failed: {str(e)[:160]}"}
 
     print(f"[OK] {ok_bio} 활성 레코드 저장")
-    return {"compounds": ok_compounds, "bioactivities": ok_bio}
+
+    # 7. 임상 약물(max_phase 있는)의 질환 indication 수집 [Synapse Indication 축]
+    n_ind = 0
+    clinical_ids = [cid for cid, c in compounds.items() if c.get("max_phase") is not None]
+    if clinical_ids:
+        print(f"[INFO] 임상 약물 {len(clinical_ids)}개의 질환 indication 수집 중...")
+        try:
+            ind_records = fetch_drug_indications(clinical_ids)
+            upsert_drug_indications_bulk(ind_records)
+            n_ind = len(ind_records)
+            print(f"[OK] {n_ind} indication 저장")
+        except Exception as e:
+            print(f"[WARN] indication 수집 실패(비치명적): {e}")
+
+    return {"compounds": ok_compounds, "bioactivities": ok_bio, "indications": n_ind}
 
 
 if __name__ == "__main__":
