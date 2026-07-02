@@ -224,6 +224,14 @@ class State(rx.State):
         return len(self.drug_rows)
 
     @rx.var
+    def drug_image_url(self) -> str:
+        """선택 약물의 2D 구조 이미지 (ChEMBL depiction SVG)."""
+        if not self.selected_drug_id:
+            return ""
+        return (f"https://www.ebi.ac.uk/chembl/api/data/image/"
+                f"{self.selected_drug_id}?format=svg")
+
+    @rx.var
     def paper_count(self) -> int:
         return len(self.paper_list)
 
@@ -388,7 +396,15 @@ class State(rx.State):
         self.detail_sid = sid
         self.detail = get_structure(sid) or {}
         self.detail_mutations = get_mutations_by_structure(sid)
-        self.detail_ligands = get_ligands_by_structure(sid)
+        ligs = get_ligands_by_structure(sid)
+        for l in ligs:  # 리간드 2D 구조 이미지 URL (RCSB CCD depiction)
+            lid = (l.get("ligand_id") or "").strip()
+            l["ligand_id"] = lid
+            l["ligand_name"] = l.get("ligand_name") or ""
+            l["img_url"] = (f"https://cdn.rcsb.org/images/ccd/labeled/{lid[0].upper()}/{lid}.svg"
+                            if lid else "")
+            l["rcsb_url"] = (f"https://www.rcsb.org/ligand/{lid}" if lid else "")
+        self.detail_ligands = ligs
         partners = get_partners_by_structure(sid)
         chains_map = get_all_chains_by_structure(sid)
         for pp in partners:
@@ -1053,11 +1069,16 @@ def _drug_detail_panel() -> rx.Component:
                             is_external=True, size="2"),
                     spacing="3", align="center", wrap="wrap",
                 ),
+                # 약물 2D 구조 + 메타
                 rx.hstack(
-                    _kv("Type", State.drug_detail["molecule_type"]),
-                    _kv("결합 PDB", State.drug_structures.length().to_string() + " 개"),
-                    _kv("임상시험", State.drug_trials.length().to_string() + " 건"),
-                    wrap="wrap", spacing="4",
+                    _struct_img(State.drug_image_url, "160px"),
+                    rx.vstack(
+                        _kv("Type", State.drug_detail["molecule_type"]),
+                        _kv("결합 PDB", State.drug_structures.length().to_string() + " 개"),
+                        _kv("임상시험", State.drug_trials.length().to_string() + " 건"),
+                        spacing="2", align="start",
+                    ),
+                    spacing="4", align="center", wrap="wrap",
                 ),
                 # 결합 PDB 구조 (요청 2·3: 어떤 PDB + inhibitor type)
                 rx.cond(
@@ -1246,8 +1267,31 @@ def _mut_item(m: dict) -> rx.Component:
     return rx.text("• ", m["mutation"], " [", m["mutation_type"], "]", size="2")
 
 
+def _struct_img(url, size: str = "150px") -> rx.Component:
+    """2D 구조 이미지 — 흰 배경 카드(어두운 테마에서 흑색 결합선 가시성 확보)."""
+    return rx.box(
+        rx.image(src=url, width="100%", height="100%",
+                 style={"objectFit": "contain"}, loading="lazy"),
+        width=size, height=size, background="white", border_radius="8px",
+        padding="4px", flex_shrink="0",
+    )
+
+
 def _lig_item(l: dict) -> rx.Component:
-    return rx.text("• ", l["ligand_id"], "  ", l["ligand_name"], size="2")
+    """리간드 — 2D 구조 + CCD/이름 (요청: 셀 클릭 시 리간드 구조 2D)."""
+    return rx.hstack(
+        rx.cond(l["img_url"] != "", _struct_img(l["img_url"], "130px")),
+        rx.vstack(
+            rx.hstack(
+                rx.badge(l["ligand_id"], variant="soft", color_scheme="gray", size="1"),
+                rx.link("RCSB ↗", href=l["rcsb_url"], is_external=True, size="1"),
+                spacing="2", align="center",
+            ),
+            rx.text(l["ligand_name"], size="1", color=rx.color("gray", 11)),
+            spacing="1", align="start",
+        ),
+        spacing="3", align="center",
+    )
 
 
 def _bound_drug_item(d: dict) -> rx.Component:
