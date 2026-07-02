@@ -562,6 +562,68 @@ def get_paper_pdf(structure_id: str) -> tuple[bytes | None, str | None]:
     return bytes(row[0]), row[1]
 
 
+# ── DOI 공유: 같은 논문(DOI)을 공유하는 구조끼리 업로드·분석 결과를 공유 ──
+def _doi_group(conn, structure_id: str) -> list[str]:
+    """이 구조와 같은 DOI 를 가진 구조 id 목록 (자기 포함). DOI 없으면 [자기]만."""
+    row = conn.execute(
+        text("SELECT doi FROM pdb_structures WHERE structure_id = :s"),
+        {"s": structure_id},
+    ).first()
+    doi = ((row[0] if row else None) or "").strip()
+    if not doi:
+        return [structure_id]
+    sids = [r[0] for r in conn.execute(
+        text("SELECT structure_id FROM pdb_structures WHERE doi = :d"), {"d": doi}
+    ).all()]
+    return sids or [structure_id]
+
+
+def get_paper_analysis_shared(structure_id: str) -> dict | None:
+    """DOI 공유 조회 — 이 구조 또는 같은 DOI 형제 구조의 논문 분석을 합쳐 반환.
+
+    반환: {structured, pdf_name, has_pdf, status, pdf_owner} (구조화·PDF 는 형제 중 보유분 사용).
+    """
+    with get_engine().connect() as conn:
+        sids = _doi_group(conn, structure_id)
+        q_struct = text(
+            "SELECT structure_id, structured, status FROM paper_analysis "
+            "WHERE structure_id IN :sids AND structured IS NOT NULL "
+            "ORDER BY (structure_id = :self) DESC LIMIT 1"
+        ).bindparams(bindparam("sids", expanding=True))
+        srow = conn.execute(q_struct, {"sids": sids, "self": structure_id}).mappings().first()
+        q_pdf = text(
+            "SELECT structure_id, pdf_name FROM paper_analysis "
+            "WHERE structure_id IN :sids AND pdf_bytes IS NOT NULL "
+            "ORDER BY (structure_id = :self) DESC LIMIT 1"
+        ).bindparams(bindparam("sids", expanding=True))
+        prow = conn.execute(q_pdf, {"sids": sids, "self": structure_id}).mappings().first()
+    if not srow and not prow:
+        return None
+    return {
+        "structured": (srow or {}).get("structured"),
+        "status": (srow or {}).get("status") or ("uploaded" if prow else "none"),
+        "pdf_name": (prow or {}).get("pdf_name"),
+        "has_pdf": bool(prow),
+        "pdf_owner": (prow or {}).get("structure_id"),
+        "struct_owner": (srow or {}).get("structure_id"),
+    }
+
+
+def get_paper_pdf_shared(structure_id: str) -> tuple[bytes | None, str | None]:
+    """DOI 공유 PDF 조회 — 형제 구조 중 PDF 보유분의 바이트 반환."""
+    with get_engine().connect() as conn:
+        sids = _doi_group(conn, structure_id)
+        q = text(
+            "SELECT pdf_bytes, pdf_name FROM paper_analysis "
+            "WHERE structure_id IN :sids AND pdf_bytes IS NOT NULL "
+            "ORDER BY (structure_id = :self) DESC LIMIT 1"
+        ).bindparams(bindparam("sids", expanding=True))
+        row = conn.execute(q, {"sids": sids, "self": structure_id}).first()
+    if not row or row[0] is None:
+        return None, None
+    return bytes(row[0]), row[1]
+
+
 def upsert_paper_conditions(structure_id: str, conditions: dict, status: str = "completed"):
     """PDB별 논문 구조화 분석 결과(structured JSONB)를 paper_analysis 에 저장."""
     import json
@@ -890,66 +952,99 @@ def get_drug_detail(chembl_id: str, uniprot_id: str) -> dict:
 
 
 def get_papers_unified(uniprot_id: str) -> list[dict]:
-    """이 단백질의 논문을 한 목록으로 통합 (papers + paper_analysis, structure_id 로 중복 제거).
+    """이 단백질의 논문을 한 목록으로 통합하되, **같은 DOI 는 한 항목으로 묶는다**.
 
-    각 항목: structure_id, title, doi, doi_url, has_structured, has_pdf, source.
-    같은 PDB 에 두 소스가 있으면 병합(제목·doi 는 papers, 구조화·pdf 는 paper_analysis).
+    같은 논문(DOI)에서 나온 여러 PDB 는 한 줄로 (structure_ids 배열). 구조화·PDF 는
+    형제 중 하나라도 있으면 반영. DOI 없는 건 structure_id 단위로.
+    각 항목: key, title, doi, doi_url, structure_ids(list), primary_sid,
+             has_structured, has_pdf, source, n_pdb.
     """
     with get_engine().connect() as conn:
         prows = conn.execute(text("""
-            SELECT p.structure_id, p.title, p.doi, p.authors, p.paper_id
+            SELECT p.structure_id, p.title, ps.doi AS doi, p.authors
             FROM papers p JOIN pdb_structures ps ON p.structure_id = ps.structure_id
             WHERE ps.uniprot_id = :uid
         """), {"uid": uniprot_id}).mappings().all()
         arows = conn.execute(text("""
-            SELECT pa.structure_id, pa.pdf_name, pa.status,
+            SELECT pa.structure_id, pa.pdf_name, ps.doi AS doi,
                    (pa.structured IS NOT NULL) AS has_structured,
                    (pa.pdf_bytes IS NOT NULL)  AS has_pdf
             FROM paper_analysis pa JOIN pdb_structures ps ON pa.structure_id = ps.structure_id
             WHERE ps.uniprot_id = :uid
         """), {"uid": uniprot_id}).mappings().all()
 
-    merged: dict[str, dict] = {}
-    for p in prows:
-        sid = p["structure_id"]
-        merged[sid] = {
-            "structure_id": sid,
-            "title": p["title"] or "(제목 없음)",
-            "doi": p["doi"] or "",
-            "authors": p["authors"] or "",
-            "has_structured": False,
-            "has_pdf": False,
-            "source": "full",
-        }
-    for a in arows:
-        sid = a["structure_id"]
-        title = a["pdf_name"] or "(파일명 없음)"
-        if sid in merged:
-            merged[sid]["has_structured"] = bool(a["has_structured"])
-            merged[sid]["has_pdf"] = bool(a["has_pdf"])
-            if merged[sid]["title"] in ("(제목 없음)", ""):
-                merged[sid]["title"] = title
-        else:
-            merged[sid] = {
-                "structure_id": sid, "title": title, "doi": "", "authors": "",
-                "has_structured": bool(a["has_structured"]),
-                "has_pdf": bool(a["has_pdf"]), "source": "pdb",
+    # DOI 있으면 doi 키, 없으면 structure_id 키로 그룹핑
+    groups: dict[str, dict] = {}
+
+    def _key(doi: str, sid: str) -> str:
+        doi = (doi or "").strip()
+        return "doi:" + doi.lower() if doi else "sid:" + sid
+
+    def _ensure(key, doi, sid, title, source):
+        if key not in groups:
+            groups[key] = {
+                "key": key, "title": title or "(제목 없음)",
+                "doi": (doi or "").strip(), "authors": "",
+                "structure_ids": [], "has_structured": False,
+                "has_pdf": False, "source": source,
             }
-    out = list(merged.values())
-    for m in out:
-        m["doi_url"] = ("https://doi.org/" + m["doi"]) if m["doi"] else ""
-    out.sort(key=lambda x: (not x["has_structured"], x["structure_id"]))
+        g = groups[key]
+        if sid not in g["structure_ids"]:
+            g["structure_ids"].append(sid)
+        return g
+
+    for p in prows:
+        g = _ensure(_key(p["doi"], p["structure_id"]), p["doi"], p["structure_id"],
+                    p["title"], "full")
+        if p["authors"]:
+            g["authors"] = p["authors"]
+        if (p["title"] or "").strip() and g["title"] in ("(제목 없음)", ""):
+            g["title"] = p["title"]
+    for a in arows:
+        title = a["pdf_name"] or "(파일명 없음)"
+        g = _ensure(_key(a["doi"], a["structure_id"]), a["doi"], a["structure_id"],
+                    title, "pdb")
+        g["has_structured"] = g["has_structured"] or bool(a["has_structured"])
+        g["has_pdf"] = g["has_pdf"] or bool(a["has_pdf"])
+        if g["title"] in ("(제목 없음)", "") and title != "(파일명 없음)":
+            g["title"] = title
+
+    # DOI 그룹은 논문분석 유무와 무관하게 같은 DOI 의 모든 PDB 를 포함시킨다
+    # (같은 논문 = 그 논문의 모든 구조. 한 곳에 업로드하면 전부 공유됨).
+    with get_engine().connect() as conn:
+        dois = [g["doi"] for g in groups.values() if g["doi"]]
+        doi_map: dict[str, list[str]] = {}
+        if dois:
+            q = text("SELECT doi, structure_id FROM pdb_structures "
+                     "WHERE uniprot_id = :uid AND doi IN :dois"
+                     ).bindparams(bindparam("dois", expanding=True))
+            for r in conn.execute(q, {"uid": uniprot_id, "dois": dois}).all():
+                doi_map.setdefault((r[0] or "").lower(), []).append(r[1])
+
+    out = list(groups.values())
+    for g in out:
+        if g["doi"] and g["doi"].lower() in doi_map:
+            allsids = sorted(set(g["structure_ids"]) | set(doi_map[g["doi"].lower()]))
+            g["structure_ids"] = allsids
+        else:
+            g["structure_ids"].sort()
+        g["primary_sid"] = g["structure_ids"][0] if g["structure_ids"] else ""
+        g["n_pdb"] = len(g["structure_ids"])
+        g["doi_url"] = ("https://doi.org/" + g["doi"]) if g["doi"] else ""
+    out.sort(key=lambda x: (not x["has_structured"], not x["has_pdf"], x["primary_sid"]))
     return out
 
 
 def get_paper_by_structure(structure_id: str) -> dict | None:
-    """papers 테이블에서 이 PDB 의 전체 분석 논문 1건 (제목·분석본문)."""
+    """papers 테이블에서 이 PDB(또는 같은 DOI 형제)의 전체 분석 논문 1건 (제목·분석본문)."""
     with get_engine().connect() as conn:
-        row = conn.execute(text("""
+        sids = _doi_group(conn, structure_id)
+        q = text("""
             SELECT paper_id, title, doi, authors, analysis_md
-            FROM papers WHERE structure_id = :sid
-            ORDER BY created_at DESC LIMIT 1
-        """), {"sid": structure_id}).mappings().first()
+            FROM papers WHERE structure_id IN :sids
+            ORDER BY (structure_id = :self) DESC, created_at DESC LIMIT 1
+        """).bindparams(bindparam("sids", expanding=True))
+        row = conn.execute(q, {"sids": sids, "self": structure_id}).mappings().first()
     return dict(row) if row else None
 
 

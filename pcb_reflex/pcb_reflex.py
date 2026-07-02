@@ -30,9 +30,11 @@ from database import (
     get_klifs_by_structure,
     get_klifs_bulk,
     get_paper_analysis,
+    get_paper_analysis_shared,
     upsert_paper_conditions,
     save_paper_pdf,
     get_paper_pdf,
+    get_paper_pdf_shared,
     get_all_mutations_by_uniprot,
     get_clinical_drugs_by_uniprot,
     get_structures_for_drug,
@@ -106,7 +108,7 @@ def _materialize_pdf(sid: str, data: bytes | None = None) -> None:
     if data is None:
         if fpath.exists():
             return
-        data, _ = get_paper_pdf(sid)
+        data, _ = get_paper_pdf_shared(sid)   # DOI 공유: 형제 구조의 PDF 도 서빙
         if not data:
             return
     updir.mkdir(parents=True, exist_ok=True)
@@ -379,8 +381,8 @@ class State(rx.State):
             self.detail_klifs_str = f"DFG: {k.get('dfg') or '-'} / αC-helix: {k.get('ac_helix') or '-'}"
         else:
             self.detail_klifs_str = ""
-        # 기존 구조화 분석
-        pa = get_paper_analysis(sid)
+        # 기존 구조화 분석 (DOI 공유 — 같은 논문 형제 구조의 분석도 반영)
+        pa = get_paper_analysis_shared(sid)
         if pa and pa.get("structured"):
             self.pdb_conditions = pa["structured"]
             self.has_conditions = True
@@ -397,10 +399,10 @@ class State(rx.State):
             self.has_full_paper = False
             self.full_paper_title = ""
             self._full_paper_text = ""
-        # 업로드 상태 초기화 + 이 PDB 에 저장된 PDF 반영 (PDB 바꾸면 이전 파일명 사라짐)
+        # 업로드 상태 초기화 + 이 PDB(또는 같은 DOI 형제)에 저장된 PDF 반영
         stored_name = (pa or {}).get("pdf_name") or ""
         self.uploaded_name = stored_name
-        self.has_pdf = bool(stored_name)
+        self.has_pdf = bool((pa or {}).get("has_pdf"))
         if self.has_pdf:
             try:
                 _materialize_pdf(sid)  # 업로드 디렉토리에 없으면 1회만 적재
@@ -586,9 +588,9 @@ class State(rx.State):
     # ── PDB별 논문 구조화 분석 (실험 세부조건) ──
     def _do_conditions(self, pdf: str, sid: str) -> dict:
         from paper_pipeline import extract_construct_conditions
-        # 임시 경로 없으면 DB 에 저장된 PDF 바이트로 임시파일 생성
+        # 임시 경로 없으면 DB 에 저장된 PDF 바이트로 임시파일 생성 (DOI 공유 포함)
         if not pdf:
-            data, _ = get_paper_pdf(sid)
+            data, _ = get_paper_pdf_shared(sid)
             if not data:
                 return {"error": "저장된 PDF가 없습니다."}
             import tempfile
@@ -1073,22 +1075,33 @@ def _drug_table() -> rx.Component:
     )
 
 
-# ── Papers (단백질 단위 통합 논문 목록 — 단일 목록) ──
+# ── Papers (단백질 단위 통합 논문 목록 — DOI 로 묶어 1편당 1항목) ──
+def _paper_pdb_badge(sid) -> rx.Component:
+    return rx.button(sid, on_click=State.open_structure_from_drug(sid),
+                     variant="soft", size="1", color_scheme="gray")
+
+
 def _paper_card(p: dict) -> rx.Component:
-    """통합 논문 카드 — PDB 클릭 시 해당 구조 세부(논문 분석)로 이동."""
+    """통합 논문 카드 — 같은 DOI 의 여러 PDB 를 함께 표시. 배지 클릭 시 구조 세부로 이동."""
     return rx.box(
         rx.hstack(
             rx.icon("file-text", size=16, color=rx.color("accent", 9)),
-            rx.button(p["structure_id"], on_click=State.open_structure_from_drug(p["structure_id"]),
-                      variant="soft", size="1", color_scheme="gray"),
             rx.text(p["title"], weight="bold", size="2"),
             rx.spacer(),
+            rx.cond(p["n_pdb"].to(int) > 1,
+                    rx.badge(p["n_pdb"].to_string() + " PDB", variant="soft",
+                             color_scheme="gray", size="1")),
             rx.cond(p["has_structured"],
                     rx.badge("구조화 분석됨", color_scheme="green", size="1"),
                     rx.cond(p["has_pdf"],
                             rx.badge("PDF 업로드됨", color_scheme="gray", size="1"),
                             rx.badge("전체 분석", color_scheme="blue", variant="soft", size="1"))),
             width="100%", align="center", spacing="2", wrap="wrap",
+        ),
+        rx.hstack(
+            rx.text("PDB", size="1", weight="bold", color=rx.color("gray", 10)),
+            rx.foreach(p["structure_ids"].to(list), _paper_pdb_badge),
+            wrap="wrap", spacing="1", align="center", width="100%",
         ),
         rx.cond(p["authors"] != "",
                 rx.text(p["authors"], size="1", color=rx.color("gray", 9))),
@@ -1103,7 +1116,8 @@ def _papers_view() -> rx.Component:
     return rx.cond(
         State.paper_count > 0,
         rx.vstack(
-            rx.text("PDB 배지를 클릭하면 해당 구조 세부(논문 분석)로 이동합니다.",
+            rx.text("같은 논문(DOI)의 여러 PDB 는 한 항목으로 묶입니다. 한 곳에 업로드·분석하면 "
+                    "같은 논문의 모든 PDB 에 반영됩니다. PDB 배지 클릭 → 구조 세부.",
                     size="1", color=rx.color("gray", 9)),
             rx.foreach(State.paper_list, _paper_card),
             spacing="2", width="100%", align="start",
