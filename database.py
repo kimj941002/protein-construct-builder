@@ -889,6 +889,112 @@ def get_drug_detail(chembl_id: str, uniprot_id: str) -> dict:
     }
 
 
+def get_papers_unified(uniprot_id: str) -> list[dict]:
+    """이 단백질의 논문을 한 목록으로 통합 (papers + paper_analysis, structure_id 로 중복 제거).
+
+    각 항목: structure_id, title, doi, doi_url, has_structured, has_pdf, source.
+    같은 PDB 에 두 소스가 있으면 병합(제목·doi 는 papers, 구조화·pdf 는 paper_analysis).
+    """
+    with get_engine().connect() as conn:
+        prows = conn.execute(text("""
+            SELECT p.structure_id, p.title, p.doi, p.authors, p.paper_id
+            FROM papers p JOIN pdb_structures ps ON p.structure_id = ps.structure_id
+            WHERE ps.uniprot_id = :uid
+        """), {"uid": uniprot_id}).mappings().all()
+        arows = conn.execute(text("""
+            SELECT pa.structure_id, pa.pdf_name, pa.status,
+                   (pa.structured IS NOT NULL) AS has_structured,
+                   (pa.pdf_bytes IS NOT NULL)  AS has_pdf
+            FROM paper_analysis pa JOIN pdb_structures ps ON pa.structure_id = ps.structure_id
+            WHERE ps.uniprot_id = :uid
+        """), {"uid": uniprot_id}).mappings().all()
+
+    merged: dict[str, dict] = {}
+    for p in prows:
+        sid = p["structure_id"]
+        merged[sid] = {
+            "structure_id": sid,
+            "title": p["title"] or "(제목 없음)",
+            "doi": p["doi"] or "",
+            "authors": p["authors"] or "",
+            "has_structured": False,
+            "has_pdf": False,
+            "source": "full",
+        }
+    for a in arows:
+        sid = a["structure_id"]
+        title = a["pdf_name"] or "(파일명 없음)"
+        if sid in merged:
+            merged[sid]["has_structured"] = bool(a["has_structured"])
+            merged[sid]["has_pdf"] = bool(a["has_pdf"])
+            if merged[sid]["title"] in ("(제목 없음)", ""):
+                merged[sid]["title"] = title
+        else:
+            merged[sid] = {
+                "structure_id": sid, "title": title, "doi": "", "authors": "",
+                "has_structured": bool(a["has_structured"]),
+                "has_pdf": bool(a["has_pdf"]), "source": "pdb",
+            }
+    out = list(merged.values())
+    for m in out:
+        m["doi_url"] = ("https://doi.org/" + m["doi"]) if m["doi"] else ""
+    out.sort(key=lambda x: (not x["has_structured"], x["structure_id"]))
+    return out
+
+
+def get_paper_by_structure(structure_id: str) -> dict | None:
+    """papers 테이블에서 이 PDB 의 전체 분석 논문 1건 (제목·분석본문)."""
+    with get_engine().connect() as conn:
+        row = conn.execute(text("""
+            SELECT paper_id, title, doi, authors, analysis_md
+            FROM papers WHERE structure_id = :sid
+            ORDER BY created_at DESC LIMIT 1
+        """), {"sid": structure_id}).mappings().first()
+    return dict(row) if row else None
+
+
+def upsert_ligand_inchikeys(records: list[dict]):
+    """ligands.inchikey 다건 갱신 (ligand_id 기준, 해당 구조의 리간드에 채움)."""
+    rows = [{"ligand_id": r.get("ligand_id"), "inchikey": r.get("inchikey")}
+            for r in records if r.get("ligand_id") and r.get("inchikey")]
+    if not rows:
+        return
+    with get_engine().begin() as conn:
+        conn.execute(text(
+            "UPDATE ligands SET inchikey = :inchikey WHERE ligand_id = :ligand_id"
+        ), rows)
+
+
+def match_ligands_to_compounds_by_inchikey(uniprot_id: str) -> int:
+    """리간드 InChIKey ↔ compounds InChIKey 구조 동일성 매칭 → ligand_chembl_map 보강.
+
+    UniChem(CCD) 이 못 잡은 것, 그리고 임상 약물이 아닌 ChEMBL 화합물도 구조가 같으면 연동.
+    exact InChIKey 우선, 없으면 connectivity block(앞 14자) 매칭.
+    Returns 신규/갱신 매핑 수.
+    """
+    with get_engine().begin() as conn:
+        res = conn.execute(text("""
+            INSERT INTO ligand_chembl_map (ligand_id, chembl_id, source, checked_at)
+            SELECT DISTINCT ON (l.ligand_id) l.ligand_id, c.chembl_id, 'inchikey', now()
+            FROM ligands l
+            JOIN pdb_structures p ON p.structure_id = l.structure_id
+            JOIN compounds c
+              ON c.inchikey = l.inchikey
+              OR split_part(c.inchikey, '-', 1) = split_part(l.inchikey, '-', 1)
+            WHERE p.uniprot_id = :uid
+              AND l.inchikey IS NOT NULL
+            ORDER BY l.ligand_id,
+                     (c.inchikey = l.inchikey) DESC,   -- exact 우선
+                     c.max_phase DESC NULLS LAST
+            ON CONFLICT (ligand_id) DO UPDATE SET
+                chembl_id  = COALESCE(ligand_chembl_map.chembl_id, EXCLUDED.chembl_id),
+                source     = CASE WHEN ligand_chembl_map.chembl_id IS NULL
+                                  THEN EXCLUDED.source ELSE ligand_chembl_map.source END,
+                checked_at = now()
+        """), {"uid": uniprot_id})
+        return res.rowcount or 0
+
+
 def get_papers_by_uniprot(uniprot_id: str) -> list[dict]:
     """이 단백질의 PDB 구조에 연결된 논문 + paper_analysis 요약을 통합 반환.
 

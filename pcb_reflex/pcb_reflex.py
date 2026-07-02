@@ -38,7 +38,8 @@ from database import (
     get_structures_for_drug,
     get_drugs_for_structure,
     get_drug_detail,
-    get_papers_by_uniprot,
+    get_papers_unified,
+    get_paper_by_structure,
 )
 from uniprot_fetcher import load_sequence_from_file
 from collect import collect_protein
@@ -168,6 +169,10 @@ class State(rx.State):
     uploading: bool = False
     upload_progress: int = 0
     has_pdf: bool = False   # 현재 PDB 에 저장된 PDF 있는지
+    # papers 테이블에만 있는 전체 분석 논문(과거 유실분 등) — PDF 없이도 구조화 가능
+    has_full_paper: bool = False
+    full_paper_title: str = ""
+    _full_paper_text: str = ""   # papers.analysis_md (구조화 추출 소스)
 
     # 활성 탭 (축 간 이동 시 제어 — 유기적 연결)
     active_tab: str = "pdb"
@@ -191,9 +196,8 @@ class State(rx.State):
     # 현재 PDB 에 결합한 약물(ChEMBL 매핑) — PDB 세부 패널용
     detail_drugs: list[dict] = []
 
-    # 논문 (단백질 단위 통합)
-    paper_rows: list[dict] = []             # papers 테이블
-    analysis_rows: list[dict] = []          # paper_analysis (PDB별 구조화)
+    # 논문 (단백질 단위 통합 — papers + paper_analysis 병합 단일 목록)
+    paper_list: list[dict] = []
 
     @rx.var
     def drug_count(self) -> int:
@@ -201,7 +205,7 @@ class State(rx.State):
 
     @rx.var
     def paper_count(self) -> int:
-        return len(self.paper_rows) + len(self.analysis_rows)
+        return len(self.paper_list)
 
     @rx.var
     def mutation_count(self) -> int:
@@ -348,24 +352,11 @@ class State(rx.State):
         self.drug_indications = []
         self.drug_structures = []
 
-        # 논문 (단백질 단위 통합) — foreach 내 문자열 연결 방지 위해 Python 측에서 정규화
+        # 논문 (papers + paper_analysis 병합 단일 목록)
         try:
-            papers, analyses = get_papers_by_uniprot(uid)
-            for pp in papers:
-                pp["title"] = pp.get("title") or "(제목 없음)"
-                pp["authors"] = pp.get("authors") or ""
-                pp["doi"] = pp.get("doi") or ""
-                pp["structure_id"] = pp.get("structure_id") or ""
-                pp["doi_url"] = ("https://doi.org/" + pp["doi"]) if pp["doi"] else ""
-            for aa in analyses:
-                aa["pdf_name"] = aa.get("pdf_name") or "(파일명 없음)"
-                aa["structure_id"] = aa.get("structure_id") or ""
-                aa["has_structured"] = bool(aa.get("has_structured"))
-            self.paper_rows = papers
-            self.analysis_rows = analyses
+            self.paper_list = get_papers_unified(uid)
         except Exception:
-            self.paper_rows = []
-            self.analysis_rows = []
+            self.paper_list = []
 
         # 세부 패널 초기화
         self.detail_sid = ""
@@ -396,6 +387,16 @@ class State(rx.State):
         else:
             self.pdb_conditions = {}
             self.has_conditions = False
+        # papers 테이블에만 있는 전체 분석 논문(과거 유실분): PDF 없이도 구조화 가능하게
+        fp = get_paper_by_structure(sid)
+        if fp and (fp.get("analysis_md") or "").strip():
+            self.has_full_paper = True
+            self.full_paper_title = fp.get("title") or "(제목 없음)"
+            self._full_paper_text = fp.get("analysis_md") or ""
+        else:
+            self.has_full_paper = False
+            self.full_paper_title = ""
+            self._full_paper_text = ""
         # 업로드 상태 초기화 + 이 PDB 에 저장된 PDF 반영 (PDB 바꾸면 이전 파일명 사라짐)
         stored_name = (pa or {}).get("pdf_name") or ""
         self.uploaded_name = stored_name
@@ -617,6 +618,35 @@ class State(rx.State):
                 self.cond_status = "오류: " + res["error"]
             else:
                 self.cond_status = "분석 완료 — Supabase 저장됨"
+                self.pdb_conditions = res["conditions"]
+                self.has_conditions = True
+
+    def _do_conditions_from_text(self, text: str, sid: str) -> dict:
+        from paper_pipeline import extract_conditions_from_text
+        r = extract_conditions_from_text(text)
+        if r.get("error"):
+            return r
+        upsert_paper_conditions(sid, r["conditions"])
+        return {"conditions": r["conditions"]}
+
+    @rx.event(background=True)
+    async def run_conditions_from_paper(self):
+        """PDF 없이 papers 의 기존 전체 분석본에서 구조화 추출 (11HQ 등 유실분 복구)."""
+        async with self:
+            if not self.detail_sid or not self._full_paper_text.strip():
+                self.cond_status = "기존 분석본이 없습니다."
+                return
+            self.cond_analyzing = True
+            self.cond_status = "기존 분석본에서 구조화 추출 중... (수십 초)"
+            txt = self._full_paper_text
+            sid = self.detail_sid
+        res = await asyncio.to_thread(self._do_conditions_from_text, txt, sid)
+        async with self:
+            self.cond_analyzing = False
+            if res.get("error"):
+                self.cond_status = "오류: " + res["error"]
+            else:
+                self.cond_status = "구조화 완료 (기존 분석본 기반) — Supabase 저장됨"
                 self.pdb_conditions = res["conditions"]
                 self.has_conditions = True
 
@@ -1043,16 +1073,22 @@ def _drug_table() -> rx.Component:
     )
 
 
-# ── Papers (단백질 단위 통합 논문 목록) ──
+# ── Papers (단백질 단위 통합 논문 목록 — 단일 목록) ──
 def _paper_card(p: dict) -> rx.Component:
+    """통합 논문 카드 — PDB 클릭 시 해당 구조 세부(논문 분석)로 이동."""
     return rx.box(
         rx.hstack(
             rx.icon("file-text", size=16, color=rx.color("accent", 9)),
+            rx.button(p["structure_id"], on_click=State.open_structure_from_drug(p["structure_id"]),
+                      variant="soft", size="1", color_scheme="gray"),
             rx.text(p["title"], weight="bold", size="2"),
             rx.spacer(),
-            rx.cond(p["structure_id"] != "",
-                    rx.badge(p["structure_id"], variant="soft", color_scheme="gray", size="1")),
-            width="100%", align="center", spacing="2",
+            rx.cond(p["has_structured"],
+                    rx.badge("구조화 분석됨", color_scheme="green", size="1"),
+                    rx.cond(p["has_pdf"],
+                            rx.badge("PDF 업로드됨", color_scheme="gray", size="1"),
+                            rx.badge("전체 분석", color_scheme="blue", variant="soft", size="1"))),
+            width="100%", align="center", spacing="2", wrap="wrap",
         ),
         rx.cond(p["authors"] != "",
                 rx.text(p["authors"], size="1", color=rx.color("gray", 9))),
@@ -1063,46 +1099,14 @@ def _paper_card(p: dict) -> rx.Component:
     )
 
 
-def _analysis_card(a: dict) -> rx.Component:
-    return rx.box(
-        rx.hstack(
-            rx.icon("microscope", size=16, color=rx.color("accent", 9)),
-            rx.badge(a["structure_id"], variant="soft", color_scheme="gray", size="1"),
-            rx.text(a["pdf_name"], size="2"),
-            rx.spacer(),
-            rx.cond(a["has_structured"],
-                    rx.badge("구조화 분석됨", color_scheme="green", size="1"),
-                    rx.badge("PDF만", color_scheme="gray", size="1")),
-            width="100%", align="center", spacing="2",
-        ),
-        border="1px solid var(--gray-5)", border_radius="12px",
-        padding="0.6rem 0.9rem", width="100%",
-    )
-
-
 def _papers_view() -> rx.Component:
     return rx.cond(
         State.paper_count > 0,
         rx.vstack(
-            rx.cond(
-                State.paper_rows.length() > 0,
-                rx.vstack(
-                    rx.text("전체 분석 논문", size="2", weight="bold", color=rx.color("gray", 11)),
-                    rx.foreach(State.paper_rows, _paper_card),
-                    spacing="2", width="100%", align="start",
-                ),
-            ),
-            rx.cond(
-                State.analysis_rows.length() > 0,
-                rx.vstack(
-                    rx.text("PDB별 업로드 논문", size="2", weight="bold", color=rx.color("gray", 11)),
-                    rx.foreach(State.analysis_rows, _analysis_card),
-                    spacing="2", width="100%", align="start",
-                ),
-            ),
-            rx.text("PDB 구조 탭에서 행을 선택하면 해당 PDB 논문을 업로드·분석할 수 있습니다.",
-                    size="1", color=rx.color("gray", 9), padding_top="0.5rem"),
-            spacing="4", width="100%", align="start",
+            rx.text("PDB 배지를 클릭하면 해당 구조 세부(논문 분석)로 이동합니다.",
+                    size="1", color=rx.color("gray", 9)),
+            rx.foreach(State.paper_list, _paper_card),
+            spacing="2", width="100%", align="start",
         ),
         rx.callout(
             "이 단백질에 연결된 논문이 아직 없습니다. 'PDB 구조' 탭에서 PDB 를 선택하고 논문 PDF 를 업로드하세요.",
@@ -1259,6 +1263,25 @@ def _pdb_detail_panel() -> rx.Component:
                 rx.link("🔗 이 PDB 의 논문 PDF 새 창에서 열기",
                         href=rx.get_upload_url(State.detail_sid + ".pdf"),
                         is_external=True, size="2", weight="bold"),
+            ),
+            # papers 에만 있는 전체 분석 논문(PDF 유실 등) — PDF 없이 구조화 가능
+            rx.cond(
+                State.has_full_paper & (~State.has_pdf),
+                rx.box(
+                    rx.hstack(
+                        rx.icon("file-check", size=16, color=rx.color("jade", 9)),
+                        rx.text("기존 전체 분석 논문 있음:", size="1", weight="bold",
+                                color=rx.color("gray", 11)),
+                        rx.text(State.full_paper_title, size="1", color=rx.color("gray", 11)),
+                        wrap="wrap", spacing="2", align="center",
+                    ),
+                    rx.text("PDF 는 없지만 저장된 분석본으로 구조화 분석을 할 수 있습니다.",
+                            size="1", color=rx.color("gray", 9)),
+                    rx.button("🔬 기존 분석본에서 구조화", on_click=State.run_conditions_from_paper,
+                              disabled=State.cond_analyzing, size="2", variant="soft"),
+                    border="1px solid var(--jade-6)", border_radius="12px",
+                    padding="0.7rem 0.9rem", width="100%",
+                ),
             ),
             rx.button("🔬 구조화 분석", on_click=State.run_pdb_conditions,
                       disabled=State.cond_analyzing | (~State.has_pdf)),

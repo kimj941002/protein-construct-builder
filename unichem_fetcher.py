@@ -22,6 +22,9 @@ import requests
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from db_config import get_engine
 from sqlalchemy import text
+from database import upsert_ligand_inchikeys, match_ligands_to_compounds_by_inchikey
+
+RCSB_CHEMCOMP = "https://data.rcsb.org/rest/v1/core/chemcomp"
 
 UNICHEM_URL = "https://www.ebi.ac.uk/unichem/api/v1/compounds"
 PDBE_SRC_ID = 3
@@ -77,6 +80,49 @@ def _save_mapping(ligand_id: str, chembl_id: str | None):
         """), {"lid": ligand_id, "cid": chembl_id})
 
 
+def fetch_ligand_inchikey(ccd: str) -> str | None:
+    """RCSB chemcomp 에서 리간드(CCD)의 InChIKey 조회."""
+    try:
+        r = requests.get(f"{RCSB_CHEMCOMP}/{ccd}", timeout=TIMEOUT)
+        if r.status_code == 200:
+            return (r.json().get("rcsb_chem_comp_descriptor", {}) or {}).get("InChIKey")
+    except Exception as e:
+        print(f"[WARN] RCSB chemcomp 조회 실패 ({ccd}): {e}")
+    return None
+
+
+def enrich_ligand_inchikeys(uniprot_acc: str = "P08581") -> dict:
+    """MET 리간드의 InChIKey 를 RCSB 에서 채운 뒤, compounds InChIKey 와 구조 매칭.
+
+    임상 약물이 아니어도 PDB 리간드와 구조(InChIKey)가 같은 ChEMBL 화합물을 연동한다.
+    """
+    print(f"\n=== 리간드 InChIKey 보강 + 구조 매칭: {uniprot_acc} ===")
+    with get_engine().connect() as c:
+        ccds = [r[0] for r in c.execute(text("""
+            SELECT DISTINCT l.ligand_id
+            FROM ligands l JOIN pdb_structures p ON p.structure_id = l.structure_id
+            WHERE p.uniprot_id = :uid AND l.ligand_id IS NOT NULL
+              AND (l.inchikey IS NULL)
+              AND l.ligand_id NOT IN (
+                  SELECT ligand_id FROM ligands WHERE inchikey IS NOT NULL)
+        """), {"uid": uniprot_acc}).all()]
+    print(f"[INFO] InChIKey 미보유 리간드 {len(ccds)}개")
+    got = 0
+    for i, ccd in enumerate(ccds):
+        if ccd.upper() in _SKIP_LIGANDS:
+            continue
+        ik = fetch_ligand_inchikey(ccd)
+        if ik:
+            upsert_ligand_inchikeys([{"ligand_id": ccd, "inchikey": ik}])
+            got += 1
+        if (i + 1) % 20 == 0:
+            print(f"  {i+1}/{len(ccds)} (InChIKey {got})")
+        time.sleep(0.1)
+    matched = match_ligands_to_compounds_by_inchikey(uniprot_acc)
+    print(f"[OK] InChIKey {got}개 보강 · 구조 매칭 {matched}건 → ligand_chembl_map")
+    return {"inchikeys": got, "matched": matched}
+
+
 def run(uniprot_acc: str = "P08581") -> dict:
     print(f"\n=== UniChem 리간드→ChEMBL 매핑: {uniprot_acc} ===")
     ligands = get_unmapped_ligands(uniprot_acc)
@@ -96,7 +142,14 @@ def run(uniprot_acc: str = "P08581") -> dict:
             print(f"  {i+1}/{len(ligands)} 처리 (매핑 {mapped})")
         time.sleep(0.15)
     print(f"[OK] 매핑됨 {mapped} / 첨가물 스킵 {skipped} / 총 {len(ligands)}")
-    return {"mapped": mapped, "skipped": skipped, "total": len(ligands)}
+    # InChIKey 구조 매칭 보강 (UniChem 이 못 잡은 것 + 비임상 화합물)
+    try:
+        ik = enrich_ligand_inchikeys(uniprot_acc)
+    except Exception as e:
+        print(f"[WARN] InChIKey 매칭 실패(비치명적): {e}")
+        ik = {}
+    return {"mapped": mapped, "skipped": skipped, "total": len(ligands),
+            "inchikey_matched": ik.get("matched", 0)}
 
 
 if __name__ == "__main__":

@@ -75,9 +75,12 @@ CREATE TABLE IF NOT EXISTS ligands (
     ligand_name  TEXT,
     formula      TEXT,
     smiles       TEXT,
-    ligand_type  TEXT
+    ligand_type  TEXT,
+    inchikey     TEXT     -- RCSB chemcomp InChIKey (ChEMBL 화합물과 구조 동일성 매칭용)
 );
 CREATE INDEX IF NOT EXISTS idx_ligands_sid ON ligands(structure_id);
+ALTER TABLE ligands ADD COLUMN IF NOT EXISTS inchikey TEXT;
+CREATE INDEX IF NOT EXISTS idx_ligands_inchikey ON ligands(inchikey);
 
 -- ── 6. partner_proteins ─────────────────────────────────────
 CREATE TABLE IF NOT EXISTS partner_proteins (
