@@ -99,6 +99,22 @@ def _phase_label(max_phase) -> str:
     return "비임상"
 
 
+def _status_color(status_var):
+    """진행상황 → 색상 (Var 대응, rx.match)."""
+    return rx.match(status_var,
+                    ("승인 완료", "green"), ("진행중", "blue"), ("중단", "red"), "gray")
+
+
+def _ct_color(status_var):
+    """CT.gov overall_status → 색상 (Var 대응)."""
+    return rx.match(status_var,
+                    ("RECRUITING", "green"), ("ACTIVE_NOT_RECRUITING", "green"),
+                    ("ENROLLING_BY_INVITATION", "green"), ("NOT_YET_RECRUITING", "green"),
+                    ("COMPLETED", "blue"),
+                    ("TERMINATED", "red"), ("WITHDRAWN", "red"), ("SUSPENDED", "amber"),
+                    "gray")
+
+
 def _materialize_pdf(sid: str, data: bytes | None = None) -> None:
     """PDF 바이트를 업로드 디렉토리에 {sid}.pdf 로 써서 /_upload 로 서빙되게 한다.
     (Reflex 내장 /_upload 경로는 로컬·Reflex Cloud 모두에서 백엔드로 라우팅됨)."""
@@ -191,9 +207,11 @@ class State(rx.State):
 
     # 약물 상세 (Synapse식 연결 — 약물 클릭 시)
     selected_drug_id: str = ""
-    drug_detail: dict = {}                   # {drug_name, max_phase, first_approval, molecule_type}
-    drug_indications: list[dict] = []        # 질환 indication 목록
-    drug_structures: list[dict] = []         # 이 약물이 결합한 PDB 구조
+    drug_detail: dict = {}                   # {drug_name, max_phase, clinical_status, molecule_type}
+    drug_trials: list[dict] = []             # ClinicalTrials.gov 임상시험
+    drug_structures: list[dict] = []         # 결합 PDB 구조 (+inhibitor type)
+    drug_summary_ai: str = ""                # LLM 임상 요약 (온디맨드)
+    summary_busy: bool = False
 
     # 현재 PDB 에 결합한 약물(ChEMBL 매핑) — PDB 세부 패널용
     detail_drugs: list[dict] = []
@@ -351,8 +369,9 @@ class State(rx.State):
         # 약물 상세 초기화
         self.selected_drug_id = ""
         self.drug_detail = {}
-        self.drug_indications = []
+        self.drug_trials = []
         self.drug_structures = []
+        self.drug_summary_ai = ""
 
         # 논문 (papers + paper_analysis 병합 단일 목록)
         try:
@@ -480,6 +499,11 @@ class State(rx.State):
                 res["unichem"] = unichem_run(uid)
             except Exception as ue:
                 res["unichem_error"] = str(ue)[:120]
+            try:
+                from ct_fetcher import run as ct_run
+                res["ct"] = ct_run(uid)   # 임상시험 + 진행상황
+            except Exception as ce:
+                res["ct_error"] = str(ce)[:120]
             return res
         except Exception as e:
             return {"error": f"{type(e).__name__}: {str(e)[:160]}"}
@@ -528,34 +552,61 @@ class State(rx.State):
 
     @rx.event
     def on_drug_clicked(self, row: dict):
-        """약물 행 클릭 → 상세(임상단계·승인·질환·결합 PDB) 로드 (Synapse식 연결)."""
+        """약물 행 클릭 → 상세(임상단계·진행상황·임상시험·결합 PDB+type) 로드."""
         self._load_drug(row.get("chembl_id"))
 
     def _load_drug(self, cid: str | None):
         if not cid:
             return
         self.selected_drug_id = cid
+        self.drug_summary_ai = ""
         try:
             det = get_drug_detail(cid, self.selected_uid)
             comp = det.get("compound", {}) or {}
             comp["drug_name"] = comp.get("pref_name") or cid
             comp["phase_label"] = _phase_label(comp.get("max_phase"))
-            comp["first_approval_str"] = (str(comp["first_approval"])
-                                          if comp.get("first_approval") else "—")
+            comp["clinical_status"] = comp.get("clinical_status") or "-"
             comp["molecule_type"] = comp.get("molecule_type") or "—"
             self.drug_detail = comp
-            inds = det.get("indications", []) or []
-            for i in inds:
-                i["phase_label"] = _phase_label(i.get("max_phase_for_ind"))
-                i["mesh_heading"] = i.get("mesh_heading") or "—"
-            self.drug_indications = inds
+            trials = det.get("trials", []) or []
+            for t in trials:
+                t["title"] = (t.get("title") or "")[:110]
+                t["phase"] = t.get("phase") or "—"
+                t["overall_status"] = t.get("overall_status") or "—"
+                t["conditions"] = t.get("conditions") or ""
+                t["why_stopped"] = t.get("why_stopped") or ""
+                t["nct_url"] = ("https://clinicaltrials.gov/study/" + (t.get("nct_id") or ""))
+            self.drug_trials = trials
         except Exception:
             self.drug_detail = {}
-            self.drug_indications = []
+            self.drug_trials = []
         try:
-            self.drug_structures = get_structures_for_drug(cid, self.selected_uid)
+            structs = get_structures_for_drug(cid, self.selected_uid)
+            for s in structs:
+                s["inhibitor_type"] = _inhibitor_type(s.get("dfg"), s.get("ac_helix"))
+            self.drug_structures = structs
         except Exception:
             self.drug_structures = []
+
+    def _do_trial_summary(self, cid: str) -> str:
+        from ct_fetcher import summarize_trials_llm
+        from database import get_drug_trials
+        name = self.drug_detail.get("drug_name") or cid
+        return summarize_trials_llm(name, get_drug_trials(cid))
+
+    @rx.event(background=True)
+    async def summarize_trials(self):
+        """(온디맨드) LLM 으로 임상 진행 서사 요약."""
+        async with self:
+            cid = self.selected_drug_id
+            if not cid or self.summary_busy:
+                return
+            self.summary_busy = True
+            self.drug_summary_ai = ""
+        text_out = await asyncio.to_thread(self._do_trial_summary, cid)
+        async with self:
+            self.summary_busy = False
+            self.drug_summary_ai = text_out
 
     @rx.event
     def set_active_tab(self, tab: str):
@@ -932,43 +983,59 @@ def _protein_overview() -> rx.Component:
     )
 
 
-# ── Drug Table (임상단계 + 결합 PDB 중심 — IC50/활성 제외) ──
+# ── Drug Table (임상단계·진행상황 + 결합 PDB 중심) ──
 _DRUG_COLUMN_DEFS = [
-    {"field": "drug_name",      "headerName": "Drug Name",       "pinned": "left",
+    {"field": "drug_name",       "headerName": "Drug Name",       "pinned": "left",
      "filter": True, "minWidth": 190,
      "headerTooltip": "ChEMBL 약물명. 정식 명칭이 없는(연구용) 화합물은 ChEMBL ID 로 표시"},
-    {"field": "max_phase",      "headerName": "임상단계",         "filter": True, "maxWidth": 100,
-     "headerTooltip": "최고 임상 단계 (ChEMBL): 4=승인, 3/2/1=임상, 공백=비임상/전임상"},
-    {"field": "top_indication", "headerName": "대표 Indication",  "filter": True, "minWidth": 200,
-     "headerTooltip": "최고 개발 단계 질환 (ChEMBL drug_indication). 상세는 행 클릭"},
-    {"field": "n_pdb",          "headerName": "결합 PDB",         "filter": "agNumberColumnFilter",
-     "maxWidth": 110, "headerTooltip": "이 약물의 리간드가 결합한 이 단백질의 PDB 구조 수 (UniChem 매핑)"},
-    {"field": "first_approval", "headerName": "승인연도",         "filter": "agNumberColumnFilter",
-     "maxWidth": 110, "headerTooltip": "최초 승인 연도 (ChEMBL first_approval)"},
-    {"field": "molecule_type",  "headerName": "Type",            "filter": True, "maxWidth": 130},
-    {"field": "chembl_id",      "headerName": "ChEMBL ID",       "filter": True, "minWidth": 130},
+    {"field": "max_phase",       "headerName": "임상단계",         "filter": True, "maxWidth": 100,
+     "headerTooltip": "최고 임상 단계 (ChEMBL): 4=승인, 3/2/1=임상, 공백=비임상"},
+    {"field": "clinical_status", "headerName": "진행상황",         "filter": True, "minWidth": 110,
+     "headerTooltip": "ClinicalTrials.gov 기반: 진행중 / 중단 / 승인 완료"},
+    {"field": "n_pdb",           "headerName": "결합 PDB",         "filter": "agNumberColumnFilter",
+     "maxWidth": 110, "headerTooltip": "이 약물이 결합한 PDB 구조 수. 행 클릭 시 어떤 PDB 인지 표시"},
+    {"field": "molecule_type",   "headerName": "Type",            "filter": True, "maxWidth": 130},
+    {"field": "chembl_id",       "headerName": "ChEMBL ID",       "filter": True, "minWidth": 130},
 ]
 
 
 def _drug_struct_chip(s: dict) -> rx.Component:
-    """약물 상세의 결합 PDB 칩 — 클릭 시 구조 세부로 이동(축 간 연결)."""
-    return rx.button(
-        s["structure_id"],
-        on_click=State.open_structure_from_drug(s["structure_id"]),
-        variant="soft", size="1", color_scheme="gray",
+    """결합 PDB 칩 — PDB ID + KLIFS 기반 inhibitor type. 클릭 시 구조 세부로 이동."""
+    return rx.tooltip(
+        rx.button(
+            rx.hstack(
+                rx.text(s["structure_id"], size="1", weight="bold"),
+                rx.cond(s["inhibitor_type"] != "-",
+                        rx.badge(s["inhibitor_type"], color_scheme="iris",
+                                 variant="soft", size="1")),
+                spacing="1", align="center",
+            ),
+            on_click=State.open_structure_from_drug(s["structure_id"]),
+            variant="soft", size="1", color_scheme="gray",
+        ),
+        content="Inhibitor type 는 KLIFS DFG/αC 입체구조 기반 추정",
     )
 
 
-def _indication_row(i: dict) -> rx.Component:
-    return rx.hstack(
-        rx.badge(i["phase_label"], color_scheme="jade", variant="soft", size="1"),
-        rx.text(i["mesh_heading"], size="2"),
-        spacing="2", align="center",
+def _trial_row(t: dict) -> rx.Component:
+    return rx.box(
+        rx.hstack(
+            rx.link(t["nct_id"], href=t["nct_url"],
+                    is_external=True, size="1", weight="bold"),
+            rx.badge(t["phase"], variant="soft", color_scheme="gray", size="1"),
+            rx.badge(t["overall_status"], variant="soft",
+                     color_scheme=_ct_color(t["overall_status"]), size="1"),
+            rx.text(t["conditions"], size="1", color=rx.color("gray", 10)),
+            wrap="wrap", spacing="2", align="center", width="100%",
+        ),
+        rx.cond(t["why_stopped"] != "",
+                rx.text("⛔ ", t["why_stopped"], size="1", color=rx.color("amber", 10))),
+        width="100%",
     )
 
 
 def _drug_detail_panel() -> rx.Component:
-    """약물 상세 — 임상단계·승인·질환 indication·결합 PDB (Synapse식 약물 중심 연결)."""
+    """약물 상세 — 임상단계·진행상황·임상시험(CT.gov)·결합 PDB(+type)·AI 요약."""
     return rx.cond(
         State.selected_drug_id != "",
         rx.box(
@@ -978,40 +1045,63 @@ def _drug_detail_panel() -> rx.Component:
                     rx.heading(State.drug_detail["drug_name"], size="4"),
                     rx.badge(State.drug_detail["phase_label"], color_scheme="jade",
                              variant="soft", size="2"),
+                    rx.badge(State.drug_detail["clinical_status"],
+                             color_scheme=_status_color(State.drug_detail["clinical_status"]),
+                             size="2"),
                     rx.link("ChEMBL ↗",
                             href="https://www.ebi.ac.uk/chembl/compound_report_card/" + State.selected_drug_id,
                             is_external=True, size="2"),
                     spacing="3", align="center", wrap="wrap",
                 ),
-                # 임상 메타
                 rx.hstack(
-                    _kv("승인연도", State.drug_detail["first_approval_str"]),
                     _kv("Type", State.drug_detail["molecule_type"]),
                     _kv("결합 PDB", State.drug_structures.length().to_string() + " 개"),
+                    _kv("임상시험", State.drug_trials.length().to_string() + " 건"),
                     wrap="wrap", spacing="4",
                 ),
-                # 질환 indications (임상 개발 대상)
-                rx.cond(
-                    State.drug_indications.length() > 0,
-                    rx.vstack(
-                        rx.text("질환 Indications (임상 개발 대상)", size="2", weight="bold",
-                                color=rx.color("gray", 11)),
-                        rx.vstack(rx.foreach(State.drug_indications, _indication_row),
-                                  spacing="1", align="start", width="100%"),
-                        spacing="1", align="start", width="100%",
-                    ),
-                ),
-                # 결합 PDB 구조 (구조 축으로 이동)
+                # 결합 PDB 구조 (요청 2·3: 어떤 PDB + inhibitor type)
                 rx.cond(
                     State.drug_structures.length() > 0,
                     rx.vstack(
-                        rx.text("결합 PDB 구조 (클릭 → 구조 세부)", size="2", weight="bold",
-                                color=rx.color("gray", 11)),
+                        rx.text("결합 PDB 구조 (PDB ID + inhibitor type · 클릭 → 구조 세부)",
+                                size="2", weight="bold", color=rx.color("gray", 11)),
                         rx.hstack(rx.foreach(State.drug_structures, _drug_struct_chip),
                                   wrap="wrap", spacing="2"),
                         spacing="1", align="start", width="100%",
                     ),
-                    rx.text("이 약물과 매핑된 PDB 구조가 없습니다 (리간드 미결합 또는 UniChem 미등록).",
+                    rx.text("이 약물과 매핑된 PDB 구조가 없습니다.",
+                            size="1", color=rx.color("gray", 9)),
+                ),
+                # 임상시험 (ClinicalTrials.gov) + AI 요약 (요청 5)
+                rx.cond(
+                    State.drug_trials.length() > 0,
+                    rx.vstack(
+                        rx.hstack(
+                            rx.text("임상시험 (ClinicalTrials.gov)", size="2", weight="bold",
+                                    color=rx.color("gray", 11)),
+                            rx.spacer(),
+                            rx.button(
+                                rx.cond(State.summary_busy, rx.spinner(),
+                                        rx.icon("sparkles", size=12)),
+                                "AI 임상 요약",
+                                on_click=State.summarize_trials, disabled=State.summary_busy,
+                                size="1", variant="soft",
+                            ),
+                            width="100%", align="center",
+                        ),
+                        rx.cond(
+                            State.drug_summary_ai != "",
+                            rx.box(rx.text(State.drug_summary_ai, size="2",
+                                           white_space="pre-wrap"),
+                                   border="1px solid var(--accent-6)", border_radius="10px",
+                                   padding="0.7rem 0.9rem", width="100%",
+                                   background=rx.color("accent", 2)),
+                        ),
+                        rx.vstack(rx.foreach(State.drug_trials, _trial_row),
+                                  spacing="2", width="100%", align="start"),
+                        spacing="2", align="start", width="100%",
+                    ),
+                    rx.text("등록된 임상시험이 없습니다 (ClinicalTrials.gov 미검색 또는 없음).",
                             size="1", color=rx.color("gray", 9)),
                 ),
                 spacing="3", align="start", width="100%",
@@ -1042,7 +1132,7 @@ def _drug_table() -> rx.Component:
         rx.cond(
             State.drug_rows.length() > 0,
             rx.vstack(
-                rx.text("임상단계·질환·결합 PDB 중심 (활성/IC50 제외). 행 클릭 → 약물 상세. "
+                rx.text("임상단계·진행상황·결합 PDB 중심. 행 클릭 → 약물 상세(임상시험·결합 PDB+type). "
                         "'약물만' 끄면 활성 화합물 전체 표시.",
                         size="1", color=rx.color("gray", 9)),
                 rx.box(
