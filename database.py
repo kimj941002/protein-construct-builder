@@ -99,6 +99,22 @@ def get_all_proteins() -> list[dict]:
     return [dict(r) for r in rows]
 
 
+def get_proteins_overview() -> list[dict]:
+    """수집 완료된 단백질 목록 + PDB 구조 수 (검색창 최근 목록용)."""
+    with get_engine().connect() as conn:
+        rows = conn.execute(text("""
+            SELECT p.uniprot_id, p.gene_name, p.protein_name, p.organism,
+                   p.sequence_length,
+                   COALESCE(s.n_pdb, 0) AS n_pdb
+            FROM proteins p
+            LEFT JOIN (SELECT uniprot_id, count(*) AS n_pdb
+                       FROM pdb_structures GROUP BY uniprot_id) s
+                   ON s.uniprot_id = p.uniprot_id
+            ORDER BY COALESCE(s.n_pdb, 0) DESC, p.gene_name
+        """)).mappings().all()
+    return [dict(r) for r in rows]
+
+
 def delete_protein(uniprot_id: str):
     with get_engine().begin() as conn:
         conn.execute(

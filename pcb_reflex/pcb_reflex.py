@@ -17,6 +17,7 @@ from .ag_grid_wrap import ag_grid
 
 from database import (
     get_all_proteins,
+    get_proteins_overview,
     get_protein,
     get_structures_by_uniprot,
     get_mutations_bulk,
@@ -131,26 +132,12 @@ def _materialize_pdf(sid: str, data: bytes | None = None) -> None:
     fpath.write_bytes(data)
 
 
-def _app_password() -> str:
-    """공유 접속 비밀번호 (secrets/env 의 APP_PASSWORD). 미설정이면 게이트 비활성(로컬 개발)."""
-    try:
-        from db_config import _load_secrets
-        return str(_load_secrets().get("APP_PASSWORD", "") or "")
-    except Exception:
-        import os
-        return os.environ.get("APP_PASSWORD", "")
-
-
 # ═══════════════════════════════════════════
 # State
 # ═══════════════════════════════════════════
 class State(rx.State):
-    # 접속 게이트 (공유 비밀번호)
-    authenticated: bool = False
-    password_input: str = ""
-    auth_error: str = ""
-
     query: str = ""
+    collected_proteins: list[dict] = []   # 수집 완료된 단백질(검색창 최근 목록)
     collecting: bool = False
     collect_status: str = ""
     not_found: bool = False
@@ -246,25 +233,6 @@ class State(rx.State):
     @rx.var
     def selected_count(self) -> int:
         return len(self.selected_structure_ids)
-
-    @rx.var
-    def gate_open(self) -> bool:
-        """비밀번호 미설정(로컬)이면 통과, 설정됐으면 로그인해야 통과."""
-        return self.authenticated or not bool(_app_password())
-
-    @rx.event
-    def set_password_input(self, v: str):
-        self.password_input = v
-
-    @rx.event
-    def do_login(self):
-        pw = _app_password()
-        if pw and self.password_input == pw:
-            self.authenticated = True
-            self.auth_error = ""
-            self.password_input = ""
-        else:
-            self.auth_error = "비밀번호가 올바르지 않습니다."
 
     # ── 내부 헬퍼 (동기) ──
     def _apply_protein(self, uid: str):
@@ -477,6 +445,32 @@ class State(rx.State):
     @rx.event
     def set_query(self, value: str):
         self.query = value
+
+    @rx.event
+    def load_collected(self):
+        """수집 완료된 단백질 목록 로드 (검색창 최근 목록)."""
+        try:
+            self.collected_proteins = get_proteins_overview()
+        except Exception:
+            self.collected_proteins = []
+
+    @rx.event(background=True)
+    async def open_protein(self, uid: str):
+        """수집된 단백질 카드 클릭 → 바로 로드 (재수집 없이)."""
+        async with self:
+            self.collecting = True
+            self.not_found = False
+            self.collect_status = "로딩 중..."
+            self.selected_uid = ""
+            self.query = ""
+        need_chembl = False
+        async with self:
+            self._apply_protein(uid)
+            self.collecting = False
+            self.collect_status = ""
+            need_chembl = not self.drug_rows
+        if need_chembl:
+            return State.fetch_chembl
 
     @rx.event(background=True)
     async def search(self):
@@ -721,11 +715,10 @@ class State(rx.State):
 
     # ── Phase 2: 논문 업로드 + 분석 ──
     @rx.event
-    def on_upload_progress(self, prog: dict):
-        """업로드 전송 진행률(0~100%) 표시."""
-        p = prog.get("progress", 0) or 0
-        self.upload_progress = round(p * 100)
-        self.uploading = self.upload_progress < 100
+    def begin_upload(self):
+        """드롭 즉시 업로드 상태 표시 (진행률 이벤트 폭주 제거 → 멈춤 방지)."""
+        self.uploading = True
+        self.cond_status = ""
 
     def _save_pdf_blocking(self, sid: str, data: bytes, name: str) -> dict:
         """(스레드) 대용량 PDF 를 DB 저장 + 임시파일 + 서빙파일 적재. 이벤트 루프 밖에서."""
@@ -1418,16 +1411,18 @@ def _pdb_detail_panel() -> rx.Component:
                     ),
                 ),
                 id="pdf_cond", accept={"application/pdf": [".pdf"]}, max_files=1,
-                on_drop=State.handle_pdf_upload(
-                    rx.upload_files(upload_id="pdf_cond",
-                                    on_upload_progress=State.on_upload_progress)
-                ),
+                # 진행률 이벤트(on_upload_progress) 제거 — 대용량 업로드 시 websocket 폭주로
+                # 특정 %에서 멈추는 문제 방지. 드롭 즉시 begin_upload 로 상태만 표시.
+                on_drop=[
+                    State.begin_upload,
+                    State.handle_pdf_upload(rx.upload_files(upload_id="pdf_cond")),
+                ],
                 border="2px dashed var(--accent-8)", padding="1.1rem",
                 border_radius="24px", width="360px", cursor="pointer",
             ),
             rx.cond(State.uploading,
                     rx.hstack(rx.spinner(),
-                              rx.text("업로드 중... " + State.upload_progress.to_string() + "%"),
+                              rx.text("업로드·저장 중... (대용량은 수십 초 소요)", size="2"),
                               spacing="2")),
             rx.cond(
                 State.has_pdf,
@@ -1480,39 +1475,45 @@ def _pdb_detail_panel() -> rx.Component:
 # ═══════════════════════════════════════════
 # 레이아웃 (단일 페이지 — 사이드바 없음)
 # ═══════════════════════════════════════════
-def _login_view() -> rx.Component:
-    return rx.center(
-        rx.vstack(
-            rx.heading("🔒 Structure research", size="6"),
-            rx.text("접속하려면 공유 비밀번호를 입력하세요.", color_scheme="gray"),
-            rx.input(
-                value=State.password_input, on_change=State.set_password_input,
-                placeholder="비밀번호", type="password", width="280px",
-            ),
-            rx.button("들어가기", on_click=State.do_login, width="280px"),
-            rx.cond(State.auth_error != "", rx.text(State.auth_error, color_scheme="red")),
-            spacing="3", align="center",
-        ),
-        height="100vh", width="100%",
-    )
-
-
 def layout(content: rx.Component) -> rx.Component:
-    return rx.cond(
-        State.gate_open,
-        rx.box(
-            rx.box(content, width="100%", max_width="1500px", margin="0 auto"),
-            padding="1.5rem", width="100%",
-        ),
-        _login_view(),
+    """게이트 없이 바로 콘텐츠 렌더 (비밀번호 제거)."""
+    return rx.box(
+        rx.box(content, width="100%", max_width="1500px", margin="0 auto"),
+        padding="1.5rem", width="100%",
     )
 
 
 # ═══════════════════════════════════════════
 # 페이지: Construct Builder
 # ═══════════════════════════════════════════
+def _collected_card(p: dict) -> rx.Component:
+    """수집 완료 단백질 카드 — 클릭 시 바로 로드."""
+    return rx.box(
+        rx.vstack(
+            rx.hstack(
+                rx.heading(p["gene_name"], size="4", weight="bold",
+                           color=rx.color("gray", 12)),
+                rx.spacer(),
+                rx.badge(p["n_pdb"].to_string() + " PDB", variant="soft",
+                         color_scheme="iris", size="1"),
+                width="100%", align="center",
+            ),
+            rx.badge(p["uniprot_id"], variant="soft", color_scheme="gray", size="1", radius="full"),
+            rx.text(p["organism"], size="1", color=rx.color("gray", 10)),
+            rx.text(p["sequence_length"].to_string() + " aa", size="1", color=rx.color("gray", 9)),
+            spacing="1", align="start", width="100%",
+        ),
+        on_click=State.open_protein(p["uniprot_id"]),
+        border="1px solid var(--gray-5)", border_radius="14px",
+        padding="0.9rem 1rem", width="200px", cursor="pointer",
+        background=rx.color("gray", 2),
+        _hover={"border_color": rx.color("accent", 8), "background": rx.color("gray", 3)},
+        transition="all 0.12s",
+    )
+
+
 def _center_search() -> rx.Component:
-    """단백질 미선택 시 — UniProt 홈처럼 가운데 큰 검색창."""
+    """단백질 미선택 시 — 가운데 큰 검색창 + 수집 완료 단백질 목록."""
     return rx.center(
         rx.vstack(
             rx.heading("PDB database", size="8"),
@@ -1530,7 +1531,25 @@ def _center_search() -> rx.Component:
             rx.cond(State.not_found,
                     rx.callout("단백질을 찾지 못했습니다. 검색어를 확인하세요.",
                                icon="triangle_alert", color_scheme="red")),
-            spacing="4", align="center",
+            # 수집 완료된 단백질 — 다시 확인하기 편하게 카드 목록
+            rx.cond(
+                State.collected_proteins.length() > 0,
+                rx.vstack(
+                    rx.hstack(
+                        rx.icon("history", size=15, color=rx.color("gray", 10)),
+                        rx.text("수집 완료 — 클릭해서 바로 열기", size="2",
+                                weight="bold", color=rx.color("gray", 11)),
+                        spacing="2", align="center",
+                    ),
+                    rx.flex(
+                        rx.foreach(State.collected_proteins, _collected_card),
+                        wrap="wrap", spacing="3", justify="center",
+                    ),
+                    spacing="3", align="center", width="100%", margin_top="1.5rem",
+                ),
+            ),
+            spacing="4", align="center", width="100%",
+            on_mount=State.load_collected,
         ),
         min_height="72vh", width="100%",
     )
