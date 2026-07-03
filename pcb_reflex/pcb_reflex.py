@@ -727,23 +727,45 @@ class State(rx.State):
         self.upload_progress = round(p * 100)
         self.uploading = self.upload_progress < 100
 
+    def _save_pdf_blocking(self, sid: str, data: bytes, name: str) -> dict:
+        """(스레드) 대용량 PDF 를 DB 저장 + 임시파일 + 서빙파일 적재. 이벤트 루프 밖에서."""
+        import tempfile
+        try:
+            save_paper_pdf(sid, data, name)
+        except Exception as ex:
+            return {"error": f"{type(ex).__name__}: {str(ex)[:160]}"}
+        path = ""
+        try:
+            fd, path = tempfile.mkstemp(suffix=".pdf")
+            with os.fdopen(fd, "wb") as out:
+                out.write(data)
+        except Exception:
+            path = ""
+        try:
+            _materialize_pdf(sid, data)
+        except Exception:
+            pass
+        return {"path": path}
+
     @rx.event
     async def handle_pdf_upload(self, files: list[rx.UploadFile]):
         if not files:
             return
-        import tempfile
         f = files[0]
-        data = await f.read()
-        fd, path = tempfile.mkstemp(suffix=".pdf")
-        with os.fdopen(fd, "wb") as out:
-            out.write(data)
-        self.uploaded_pdf_path = path
+        try:
+            data = await f.read()
+        except Exception as ex:
+            self.uploading = False
+            self.upload_progress = 0
+            self.cond_status = f"PDF 읽기 실패: {type(ex).__name__}"
+            return
         name = getattr(f, "name", None) or getattr(f, "filename", "") or "uploaded.pdf"
+        sid = self.detail_sid
         self.uploaded_name = name
         self.analyze_result_md = ""
         self.analyze_status = ""
 
-        if not self.detail_sid:
+        if not sid:
             self.cond_status = "먼저 PDB 행을 선택한 뒤 PDF 를 올려주세요."
             self.uploading = False
             self.upload_progress = 0
@@ -754,29 +776,30 @@ class State(rx.State):
             self.upload_progress = 0
             return
 
-        # 1) DB 에 원본 저장(누적, 덮어쓰기) — 이게 성공하면 업로드 성공으로 간주
+        # 블로킹 DB 저장/파일쓰기를 스레드로 → 이벤트 루프 프리즈(업로드 중 멈춤) 방지.
+        # 타임아웃으로 uploading 을 반드시 해제(대용량·풀러 지연 시 무한대기 방지).
         try:
-            save_paper_pdf(self.detail_sid, data, name)
+            result = await asyncio.wait_for(
+                asyncio.to_thread(self._save_pdf_blocking, sid, data, name),
+                timeout=180,
+            )
+        except asyncio.TimeoutError:
+            result = {"error": "저장 시간 초과(180s) — 파일이 너무 크거나 DB 연결 지연"}
         except Exception as ex:
-            self.has_pdf = False
-            self.cond_status = f"PDF 저장 실패: {type(ex).__name__}: {str(ex)[:160]}"
-            self.uploading = False
-            self.upload_progress = 0
-            return
-        self.has_pdf = True
-        # 새 PDF 로 교체 → 이전 구조화 분석 결과 비우고 재분석 유도
-        self.pdb_conditions = {}
-        self.has_conditions = False
+            result = {"error": f"{type(ex).__name__}: {str(ex)[:160]}"}
 
-        # 2) 새 창 열람용 서빙 파일 적재(실패해도 비치명적 — 열 때 DB 에서 재생성)
-        try:
-            _materialize_pdf(self.detail_sid, data)
-        except Exception:
-            pass
-
-        self.cond_status = "새 PDF 업로드 완료 — '구조화 분석'을 눌러 새로 분석하세요."
+        # 성공/실패 무관하게 업로드 상태는 반드시 해제
         self.uploading = False
         self.upload_progress = 100
+        if result.get("error"):
+            self.has_pdf = False
+            self.cond_status = "PDF 저장 실패: " + result["error"]
+        else:
+            self.has_pdf = True
+            self.pdb_conditions = {}          # 새 PDF → 이전 구조화 분석 비움
+            self.has_conditions = False
+            self.uploaded_pdf_path = result.get("path", "")
+            self.cond_status = "새 PDF 업로드 완료 — '구조화 분석'을 눌러 새로 분석하세요."
 
     def _do_analysis(self, pdf: str, targets: list[str]) -> dict:
         """(스레드) 분석 실행 + papers/paper_analysis 저장."""
