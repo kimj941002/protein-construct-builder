@@ -41,3 +41,6 @@ papers/*.pdf
 
 # 로컬 preview 실행 설정 (머신별 절대경로)
 .claude/launch.json
+
+# Reflex 업로드 서빙 디렉토리 (런타임 생성)
+uploaded_files/
