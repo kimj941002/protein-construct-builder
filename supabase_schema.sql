@@ -144,10 +144,12 @@ CREATE TABLE IF NOT EXISTS paper_analysis (
     status       TEXT DEFAULT 'none',
     raw_text     TEXT,
     structured   JSONB,   -- PDB별 논문 구조화 분석(주제/통찰/클로닝/발현/정제/결정화/어세이)
-    pdf_bytes    BYTEA,   -- 업로드한 논문 PDF 원본(누적)
+    pdf_bytes    BYTEA,   -- (레거시) 업로드 PDF 원본. 대용량은 Storage 사용.
     pdf_name     TEXT,
+    pdf_storage_path TEXT, -- Supabase Storage 경로(대용량 PDF, Cloud 크기한계 우회)
     analyzed_at  TIMESTAMPTZ
 );
+ALTER TABLE paper_analysis ADD COLUMN IF NOT EXISTS pdf_storage_path TEXT;
 
 -- ── 11. app_state ───────────────────────────────────────────
 CREATE TABLE IF NOT EXISTS app_state (

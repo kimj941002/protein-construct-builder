@@ -35,6 +35,8 @@ from database import (
     upsert_paper_conditions,
     save_paper_pdf,
     get_paper_pdf,
+    get_paper_storage_path,
+    save_paper_storage,
     get_paper_pdf_shared,
     get_all_mutations_by_uniprot,
     get_clinical_drugs_by_uniprot,
@@ -174,6 +176,8 @@ class State(rx.State):
     uploading: bool = False
     upload_progress: int = 0
     has_pdf: bool = False   # 현재 PDB 에 저장된 PDF 있는지
+    _pending_storage_path: str = ""   # 진행 중 Storage 업로드 경로
+    pdf_open_url: str = ""            # Storage 서명 다운로드 URL (열람용)
     # papers 테이블에만 있는 전체 분석 논문(과거 유실분 등) — PDF 없이도 구조화 가능
     has_full_paper: bool = False
     full_paper_title: str = ""
@@ -405,10 +409,21 @@ class State(rx.State):
         # 업로드 상태 초기화 + 이 PDB(또는 같은 DOI 형제)에 저장된 PDF 반영
         stored_name = (pa or {}).get("pdf_name") or ""
         self.uploaded_name = stored_name
-        self.has_pdf = bool((pa or {}).get("has_pdf"))
-        if self.has_pdf:
+        self.has_pdf = bool(stored_name)
+        self.pdf_open_url = ""
+        try:
+            sp = get_paper_storage_path(sid)
+        except Exception:
+            sp = None
+        if sp:  # Storage 저장분 → 서명 다운로드 URL (Cloud 에서도 확실히 열림)
             try:
-                _materialize_pdf(sid)  # 업로드 디렉토리에 없으면 1회만 적재
+                from supabase_storage import create_signed_download
+                self.pdf_open_url = create_signed_download(sp)
+            except Exception:
+                self.pdf_open_url = ""
+        elif self.has_pdf:  # 레거시 pdf_bytes → /_upload 서빙파일 적재
+            try:
+                _materialize_pdf(sid)
             except Exception:
                 pass
         self.uploaded_pdf_path = ""
@@ -713,82 +728,74 @@ class State(rx.State):
                 self.pdb_conditions = res["conditions"]
                 self.has_conditions = True
 
-    # ── Phase 2: 논문 업로드 + 분석 ──
-    def _save_pdf_blocking(self, sid: str, data: bytes, name: str) -> dict:
-        """(스레드) 대용량 PDF 를 DB 저장 + 임시파일 + 서빙파일 적재. 이벤트 루프 밖에서."""
-        import tempfile
-        try:
-            save_paper_pdf(sid, data, name)
-        except Exception as ex:
-            return {"error": f"{type(ex).__name__}: {str(ex)[:160]}"}
-        path = ""
-        try:
-            fd, path = tempfile.mkstemp(suffix=".pdf")
-            with os.fdopen(fd, "wb") as out:
-                out.write(data)
-        except Exception:
-            path = ""
-        try:
-            _materialize_pdf(sid, data)
-        except Exception:
-            pass
-        return {"path": path}
-
+    # ── Phase 2: 논문 업로드 (Supabase Storage 직접 업로드 — Cloud 크기한계 우회) ──
     @rx.event
-    async def handle_pdf_upload(self, files: list[rx.UploadFile]):
-        """전송 완료 후 호출됨(단일 핸들러 = 업로드 확실히 트리거). async generator 로
-        yield 하여 저장 중 스피너를 즉시 표시하고, 블로킹 DB 저장은 스레드로."""
-        if not files:
-            return
-        f = files[0]
-        try:
-            data = await f.read()
-        except Exception as ex:
-            self.uploading = False
-            self.cond_status = f"PDF 읽기 실패: {type(ex).__name__}"
-            return
-        name = getattr(f, "name", None) or getattr(f, "filename", "") or "uploaded.pdf"
+    def start_direct_upload(self, value):
+        """파일 선택 시: 서명 업로드 URL 생성 후, 브라우저가 Storage 로 직접 PUT (call_script)."""
+        # value 는 파일 input 의 값(가짜 경로) — 파일명 추출
+        raw = value if isinstance(value, str) else ""
+        fname = raw.replace("\\", "/").split("/")[-1] or "uploaded.pdf"
         sid = self.detail_sid
-        self.uploaded_name = name
-        self.analyze_result_md = ""
-        self.analyze_status = ""
-
         if not sid:
             self.cond_status = "먼저 PDB 행을 선택한 뒤 PDF 를 올려주세요."
-            self.uploading = False
             return
-        if not data:
-            self.cond_status = "PDF 내용을 읽지 못했습니다(빈 파일)."
-            self.uploading = False
+        if fname and not fname.lower().endswith(".pdf"):
+            self.cond_status = "PDF 파일만 업로드할 수 있습니다."
             return
-
-        # 저장 시작 → 스피너 표시 (yield 로 즉시 프론트 반영)
-        self.uploading = True
-        self.cond_status = "PDF 저장 중... (수 초)"
-        yield
-
-        # 블로킹 DB 저장/파일쓰기를 스레드로 → 이벤트 루프 안 막힘. 타임아웃으로 무한대기 방지.
         try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(self._save_pdf_blocking, sid, data, name),
-                timeout=180,
-            )
-        except asyncio.TimeoutError:
-            result = {"error": "저장 시간 초과(180s) — DB 연결 지연"}
+            from supabase_storage import create_signed_upload, storage_path_for
+            path = storage_path_for(sid, fname)
+            sig = create_signed_upload(path)
+            signed_url = sig.get("signed_url")
+            if not signed_url:
+                raise RuntimeError("서명 URL 생성 실패")
         except Exception as ex:
-            result = {"error": f"{type(ex).__name__}: {str(ex)[:160]}"}
+            self.cond_status = ("업로드 준비 실패: " + str(ex)[:150] +
+                                " (secrets 에 SUPABASE_SERVICE_KEY 필요)")
+            return
+        self.uploading = True
+        self.uploaded_name = fname
+        self._pending_storage_path = path
+        self.analyze_result_md = ""
+        self.analyze_status = ""
+        self.cond_status = "Storage 로 업로드 중... (대용량도 가능)"
+        # 브라우저 → Supabase Storage 직접 PUT (Reflex 백엔드 안 거침 → 크기 무제한)
+        js = (
+            "(async () => {"
+            "  const inp = document.getElementById('pdf_direct_input');"
+            "  if (!inp || !inp.files || !inp.files[0]) return {error:'파일 없음'};"
+            "  try {"
+            "    const r = await fetch(" + repr(signed_url) + ", {"
+            "      method:'PUT', headers:{'x-upsert':'true'}, body: inp.files[0]"
+            "    });"
+            "    if (r.ok) return {ok:true};"
+            "    const t = await r.text();"
+            "    return {error:'HTTP '+r.status+' '+(t||'').slice(0,120)};"
+            "  } catch(e){ return {error:String(e)}; }"
+            "})()"
+        )
+        return rx.call_script(js, callback=State.on_direct_upload_result)
 
-        # 성공/실패 무관하게 업로드 상태는 반드시 해제
+    @rx.event
+    def on_direct_upload_result(self, result):
+        """Storage 업로드 콜백 → 성공 시 DB 에 경로 저장."""
         self.uploading = False
-        if result.get("error"):
+        if not result or (isinstance(result, dict) and result.get("error")):
             self.has_pdf = False
-            self.cond_status = "PDF 저장 실패: " + result["error"]
-        else:
-            self.has_pdf = True
-            self.pdb_conditions = {}          # 새 PDF → 이전 구조화 분석 비움
-            self.has_conditions = False
-            self.uploaded_pdf_path = result.get("path", "")
-            self.cond_status = "새 PDF 업로드 완료 — '구조화 분석'을 눌러 새로 분석하세요."
+            msg = result.get("error") if isinstance(result, dict) else "알 수 없는 오류"
+            self.cond_status = "업로드 실패: " + str(msg)
+            return
+        try:
+            from database import save_paper_storage
+            save_paper_storage(self.detail_sid, self._pending_storage_path, self.uploaded_name)
+        except Exception as ex:
+            self.cond_status = "경로 저장 실패: " + str(ex)[:150]
+            return
+        self.has_pdf = True
+        self.pdb_conditions = {}
+        self.has_conditions = False
+        self.uploaded_pdf_path = ""
+        self.cond_status = "새 PDF 업로드 완료 (Storage) — '구조화 분석'을 눌러 새로 분석하세요."
 
     def _do_analysis(self, pdf: str, targets: list[str]) -> dict:
         """(스레드) 분석 실행 + papers/paper_analysis 저장."""
@@ -1391,37 +1398,46 @@ def _pdb_detail_panel() -> rx.Component:
             rx.heading("📄 논문 실험조건 분석", size="4"),
             rx.text("이 PDB 를 발표한 논문 PDF 를 업로드하면 주제·통찰 + 실험 세부조건을 정리합니다.",
                     color_scheme="gray", size="2"),
-            rx.upload(
+            # Supabase Storage 직접 업로드 (브라우저→Storage, Reflex Cloud 크기한계 우회)
+            # 클릭 → 파일 선택 → start_direct_upload 가 서명URL 생성 → JS 가 직접 PUT.
+            rx.el.label(
                 rx.cond(
                     State.uploaded_name != "",
                     rx.vstack(
                         rx.icon("file-text", size=24),
                         rx.text("📄 " + State.uploaded_name, size="2", weight="bold"),
-                        rx.text("다른 PDF 로 교체하려면 클릭/드롭", size="1", color_scheme="gray"),
+                        rx.text("다른 PDF 로 교체하려면 클릭", size="1", color_scheme="gray"),
                         align="center", spacing="1",
                     ),
                     rx.vstack(
                         rx.icon("file-up", size=26),
-                        rx.text("여기를 클릭해 논문 PDF 선택 (선택 즉시 업로드)", size="2"),
+                        rx.text("여기를 클릭해 논문 PDF 선택 (대용량 가능)", size="2"),
                         align="center", spacing="1",
                     ),
                 ),
-                id="pdf_cond", accept={"application/pdf": [".pdf"]}, max_files=1,
-                # 단일 핸들러 = 업로드 확실히 트리거(리스트/on_upload_progress 형태는 트리거
-                # 실패·websocket 폭주로 멈추는 문제 有). 스피너는 핸들러 내부 yield 로 표시.
-                on_drop=State.handle_pdf_upload(rx.upload_files(upload_id="pdf_cond")),
+                rx.el.input(
+                    type="file", id="pdf_direct_input", accept="application/pdf",
+                    on_change=State.start_direct_upload,
+                    style={"display": "none"},
+                ),
+                display="flex", align_items="center", justify_content="center",
                 border="2px dashed var(--accent-8)", padding="1.1rem",
                 border_radius="24px", width="360px", cursor="pointer",
             ),
             rx.cond(State.uploading,
                     rx.hstack(rx.spinner(),
-                              rx.text("업로드·저장 중... (대용량은 수십 초 소요)", size="2"),
+                              rx.text("Storage 로 업로드 중...", size="2"),
                               spacing="2")),
             rx.cond(
                 State.has_pdf,
-                rx.link("🔗 이 PDB 의 논문 PDF 새 창에서 열기",
-                        href=rx.get_upload_url(State.detail_sid + ".pdf"),
-                        is_external=True, size="2", weight="bold"),
+                rx.cond(
+                    State.pdf_open_url != "",
+                    rx.link("🔗 이 PDB 의 논문 PDF 새 창에서 열기",
+                            href=State.pdf_open_url, is_external=True, size="2", weight="bold"),
+                    rx.link("🔗 이 PDB 의 논문 PDF 새 창에서 열기",
+                            href=rx.get_upload_url(State.detail_sid + ".pdf"),
+                            is_external=True, size="2", weight="bold"),
+                ),
             ),
             # papers 에만 있는 전체 분석 논문(PDF 유실 등) — PDF 없이 구조화 가능
             rx.cond(

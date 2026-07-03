@@ -14,3 +14,5 @@ reflex==0.9.6.post1
 # Reflex 통합 앱(논문분석·지식베이스 의미검색)용 — 클라우드 배포에 필요
 PyMuPDF>=1.24.0
 fastembed>=0.3.0
+# 대용량 PDF Supabase Storage 직접 업로드용 (Cloud 크기한계 우회)
+supabase>=2.0.0

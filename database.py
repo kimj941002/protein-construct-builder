@@ -566,16 +566,52 @@ def save_paper_pdf(structure_id: str, pdf_bytes: bytes, pdf_name: str):
         """), {"sid": structure_id, "b": pdf_bytes, "n": pdf_name})
 
 
+def save_paper_storage(structure_id: str, storage_path: str, pdf_name: str):
+    """대용량 PDF: Supabase Storage 경로만 저장(바이트는 Storage 에). pdf_bytes 는 비운다."""
+    with get_engine().begin() as conn:
+        conn.execute(text("""
+            INSERT INTO paper_analysis (structure_id, pdf_storage_path, pdf_name, pdf_bytes, status)
+            VALUES (:sid, :p, :n, NULL,
+                    COALESCE((SELECT status FROM paper_analysis WHERE structure_id=:sid), 'uploaded'))
+            ON CONFLICT (structure_id) DO UPDATE SET
+                pdf_storage_path = EXCLUDED.pdf_storage_path,
+                pdf_name         = EXCLUDED.pdf_name,
+                pdf_bytes        = NULL
+        """), {"sid": structure_id, "p": storage_path, "n": pdf_name})
+
+
 def get_paper_pdf(structure_id: str) -> tuple[bytes | None, str | None]:
-    """저장된 PDF 원본(바이트, 파일명) 반환."""
+    """저장된 PDF 원본(바이트, 파일명) 반환. pdf_bytes 없으면 Storage 에서 다운로드."""
     with get_engine().connect() as conn:
         row = conn.execute(
-            text("SELECT pdf_bytes, pdf_name FROM paper_analysis WHERE structure_id = :sid"),
+            text("SELECT pdf_bytes, pdf_name, pdf_storage_path "
+                 "FROM paper_analysis WHERE structure_id = :sid"),
             {"sid": structure_id},
         ).first()
-    if not row or row[0] is None:
+    if not row:
         return None, None
-    return bytes(row[0]), row[1]
+    pdf_bytes, pdf_name, storage_path = row[0], row[1], row[2]
+    if pdf_bytes is not None:
+        return bytes(pdf_bytes), pdf_name
+    if storage_path:
+        try:
+            from supabase_storage import download_bytes
+            data = download_bytes(storage_path)
+            if data:
+                return bytes(data), pdf_name
+        except Exception:
+            pass
+    return None, pdf_name
+
+
+def get_paper_storage_path(structure_id: str) -> str | None:
+    """DOI 공유 포함 이 구조(또는 형제)의 Storage 경로 (열람 링크용)."""
+    with get_engine().connect() as conn:
+        row = conn.execute(
+            text("SELECT pdf_storage_path FROM paper_analysis WHERE structure_id = :sid"),
+            {"sid": structure_id},
+        ).first()
+    return row[0] if row and row[0] else None
 
 
 # ── DOI 공유: 같은 논문(DOI)을 공유하는 구조끼리 업로드·분석 결과를 공유 ──

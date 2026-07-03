@@ -17,6 +17,7 @@ KEYS = [
     "SUPABASE_DB_PASSWORD",
     "SUPABASE_PROJECT_REF",
     "SUPABASE_POOLER_HOST",
+    "SUPABASE_SERVICE_KEY",   # Storage 직접 업로드용 (대용량 PDF)
     "ANTHROPIC_API_KEY",
 ]
 
