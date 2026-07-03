@@ -714,12 +714,6 @@ class State(rx.State):
                 self.has_conditions = True
 
     # ── Phase 2: 논문 업로드 + 분석 ──
-    @rx.event
-    def begin_upload(self):
-        """드롭 즉시 업로드 상태 표시 (진행률 이벤트 폭주 제거 → 멈춤 방지)."""
-        self.uploading = True
-        self.cond_status = ""
-
     def _save_pdf_blocking(self, sid: str, data: bytes, name: str) -> dict:
         """(스레드) 대용량 PDF 를 DB 저장 + 임시파일 + 서빙파일 적재. 이벤트 루프 밖에서."""
         import tempfile
@@ -742,6 +736,8 @@ class State(rx.State):
 
     @rx.event
     async def handle_pdf_upload(self, files: list[rx.UploadFile]):
+        """전송 완료 후 호출됨(단일 핸들러 = 업로드 확실히 트리거). async generator 로
+        yield 하여 저장 중 스피너를 즉시 표시하고, 블로킹 DB 저장은 스레드로."""
         if not files:
             return
         f = files[0]
@@ -749,7 +745,6 @@ class State(rx.State):
             data = await f.read()
         except Exception as ex:
             self.uploading = False
-            self.upload_progress = 0
             self.cond_status = f"PDF 읽기 실패: {type(ex).__name__}"
             return
         name = getattr(f, "name", None) or getattr(f, "filename", "") or "uploaded.pdf"
@@ -761,29 +756,30 @@ class State(rx.State):
         if not sid:
             self.cond_status = "먼저 PDB 행을 선택한 뒤 PDF 를 올려주세요."
             self.uploading = False
-            self.upload_progress = 0
             return
         if not data:
             self.cond_status = "PDF 내용을 읽지 못했습니다(빈 파일)."
             self.uploading = False
-            self.upload_progress = 0
             return
 
-        # 블로킹 DB 저장/파일쓰기를 스레드로 → 이벤트 루프 프리즈(업로드 중 멈춤) 방지.
-        # 타임아웃으로 uploading 을 반드시 해제(대용량·풀러 지연 시 무한대기 방지).
+        # 저장 시작 → 스피너 표시 (yield 로 즉시 프론트 반영)
+        self.uploading = True
+        self.cond_status = "PDF 저장 중... (수 초)"
+        yield
+
+        # 블로킹 DB 저장/파일쓰기를 스레드로 → 이벤트 루프 안 막힘. 타임아웃으로 무한대기 방지.
         try:
             result = await asyncio.wait_for(
                 asyncio.to_thread(self._save_pdf_blocking, sid, data, name),
                 timeout=180,
             )
         except asyncio.TimeoutError:
-            result = {"error": "저장 시간 초과(180s) — 파일이 너무 크거나 DB 연결 지연"}
+            result = {"error": "저장 시간 초과(180s) — DB 연결 지연"}
         except Exception as ex:
             result = {"error": f"{type(ex).__name__}: {str(ex)[:160]}"}
 
         # 성공/실패 무관하게 업로드 상태는 반드시 해제
         self.uploading = False
-        self.upload_progress = 100
         if result.get("error"):
             self.has_pdf = False
             self.cond_status = "PDF 저장 실패: " + result["error"]
@@ -1411,12 +1407,9 @@ def _pdb_detail_panel() -> rx.Component:
                     ),
                 ),
                 id="pdf_cond", accept={"application/pdf": [".pdf"]}, max_files=1,
-                # 진행률 이벤트(on_upload_progress) 제거 — 대용량 업로드 시 websocket 폭주로
-                # 특정 %에서 멈추는 문제 방지. 드롭 즉시 begin_upload 로 상태만 표시.
-                on_drop=[
-                    State.begin_upload,
-                    State.handle_pdf_upload(rx.upload_files(upload_id="pdf_cond")),
-                ],
+                # 단일 핸들러 = 업로드 확실히 트리거(리스트/on_upload_progress 형태는 트리거
+                # 실패·websocket 폭주로 멈추는 문제 有). 스피너는 핸들러 내부 yield 로 표시.
+                on_drop=State.handle_pdf_upload(rx.upload_files(upload_id="pdf_cond")),
                 border="2px dashed var(--accent-8)", padding="1.1rem",
                 border_radius="24px", width="360px", cursor="pointer",
             ),
