@@ -56,14 +56,44 @@ def storage_path_for(sid: str, filename: str) -> str:
 
 
 def create_signed_upload(path: str) -> dict:
-    """브라우저가 PUT 할 서명 업로드 URL. {signed_url, token, path}."""
+    """브라우저가 PUT 할 서명 업로드 URL. {signed_url, token, path}.
+
+    같은 경로에 파일이 이미 있으면 create_signed_upload_url 이 409(Duplicate)를 내므로,
+    기존 객체를 먼저 지우고(덮어쓰기) 재시도한다.
+    """
     ensure_bucket()
-    res = _client().storage.from_(BUCKET).create_signed_upload_url(path)
+    b = _client().storage.from_(BUCKET)
+    try:
+        res = b.create_signed_upload_url(path)
+    except Exception as e:
+        s = str(e)
+        if "409" in s or "Duplicate" in s or "already exist" in s.lower():
+            try:
+                b.remove([path])   # 덮어쓰기 위해 기존 삭제
+            except Exception:
+                pass
+            res = b.create_signed_upload_url(path)
+        else:
+            raise
     if isinstance(res, dict):
         url = res.get("signed_url") or res.get("signedUrl") or res.get("signedURL")
         return {"signed_url": url, "token": res.get("token"), "path": res.get("path") or path}
     return {"signed_url": getattr(res, "signed_url", None),
             "token": getattr(res, "token", None), "path": path}
+
+
+def object_exists(path: str) -> bool:
+    """업로드 검증용 — Storage 에 실제로 객체가 있는지 확인."""
+    try:
+        b = _client().storage.from_(BUCKET)
+        parts = path.rsplit("/", 1)
+        folder = parts[0] if len(parts) == 2 else ""
+        name = parts[-1]
+        items = b.list(folder) or []
+        return any((it.get("name") if isinstance(it, dict) else getattr(it, "name", None)) == name
+                   for it in items)
+    except Exception:
+        return False
 
 
 def create_signed_download(path: str, expires: int = 3600) -> str:

@@ -33,7 +33,6 @@ from database import (
     get_paper_analysis,
     get_paper_analysis_shared,
     upsert_paper_conditions,
-    save_paper_pdf,
     get_paper_pdf,
     get_paper_storage_path,
     save_paper_storage,
@@ -48,6 +47,21 @@ from database import (
 )
 from uniprot_fetcher import load_sequence_from_file
 from collect import collect_protein
+
+
+def _warm_db():
+    """백엔드 시작 시 DB 풀 연결을 미리 데워 첫 조회(수집목록)의 콜드스타트 지연을 없앤다."""
+    try:
+        from db_config import get_engine
+        from sqlalchemy import text as _t
+        with get_engine().connect() as _c:
+            _c.execute(_t("SELECT 1"))
+    except Exception:
+        pass
+
+
+import threading as _threading
+_threading.Thread(target=_warm_db, daemon=True).start()
 
 # 도메인 트랙 색상
 _DOMAIN_COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3",
@@ -174,10 +188,9 @@ class State(rx.State):
     analyze_result_md: str = ""
     # 업로드 진행 표시
     uploading: bool = False
-    upload_progress: int = 0
     has_pdf: bool = False   # 현재 PDB 에 저장된 PDF 있는지
     _pending_storage_path: str = ""   # 진행 중 Storage 업로드 경로
-    pdf_open_url: str = ""            # Storage 서명 다운로드 URL (열람용)
+    has_storage_pdf: bool = False     # 현재 PDF 가 Storage 저장분인지
     # papers 테이블에만 있는 전체 분석 논문(과거 유실분 등) — PDF 없이도 구조화 가능
     has_full_paper: bool = False
     full_paper_title: str = ""
@@ -410,25 +423,11 @@ class State(rx.State):
         stored_name = (pa or {}).get("pdf_name") or ""
         self.uploaded_name = stored_name
         self.has_pdf = bool(stored_name)
-        self.pdf_open_url = ""
-        try:
-            sp = get_paper_storage_path(sid)
-        except Exception:
-            sp = None
-        if sp:  # Storage 저장분 → 서명 다운로드 URL (Cloud 에서도 확실히 열림)
-            try:
-                from supabase_storage import create_signed_download
-                self.pdf_open_url = create_signed_download(sp)
-            except Exception:
-                self.pdf_open_url = ""
-        elif self.has_pdf:  # 레거시 pdf_bytes → /_upload 서빙파일 적재
-            try:
-                _materialize_pdf(sid)
-            except Exception:
-                pass
+        # ★렉 방지: Storage 서명 URL 생성(네트워크)은 여기서 안 함 — '열기' 클릭 시 on-demand.
+        #  Storage 여부만 표시해 열기 방식을 결정.
+        self.has_storage_pdf = bool((pa or {}).get("pdf_storage_path"))
         self.uploaded_pdf_path = ""
         self.uploading = False
-        self.upload_progress = 0
         self.cond_status = ""
         # 이 PDB 에 결합한 약물(ChEMBL 매핑) — 구조↔약물 연결
         try:
@@ -778,24 +777,58 @@ class State(rx.State):
 
     @rx.event
     def on_direct_upload_result(self, result):
-        """Storage 업로드 콜백 → 성공 시 DB 에 경로 저장."""
+        """Storage 업로드 콜백 → 실제 저장 검증 후 DB 에 경로 저장."""
         self.uploading = False
-        if not result or (isinstance(result, dict) and result.get("error")):
-            self.has_pdf = False
-            msg = result.get("error") if isinstance(result, dict) else "알 수 없는 오류"
-            self.cond_status = "업로드 실패: " + str(msg)
+        self.has_pdf = False
+        # JS PUT 이 에러를 보고했으면 실패
+        if isinstance(result, dict) and result.get("error"):
+            self.cond_status = "업로드 실패: " + str(result.get("error"))
             return
+        # ★실제로 Storage 에 파일이 올라갔는지 서버에서 검증 (이름만 남는 문제 방지)
         try:
+            from supabase_storage import object_exists
+            if not object_exists(self._pending_storage_path):
+                self.uploaded_name = ""
+                self.cond_status = "업로드 실패 — Storage 에 파일이 확인되지 않습니다. 다시 시도하세요."
+                return
             from database import save_paper_storage
             save_paper_storage(self.detail_sid, self._pending_storage_path, self.uploaded_name)
         except Exception as ex:
-            self.cond_status = "경로 저장 실패: " + str(ex)[:150]
+            self.cond_status = "저장/검증 실패: " + str(ex)[:150]
             return
         self.has_pdf = True
+        self.has_storage_pdf = True
         self.pdb_conditions = {}
         self.has_conditions = False
         self.uploaded_pdf_path = ""
         self.cond_status = "새 PDF 업로드 완료 (Storage) — '구조화 분석'을 눌러 새로 분석하세요."
+
+    @rx.event
+    def open_pdf(self):
+        """논문 PDF 새 창 열기 — 클릭 시에만 URL 생성(행 클릭마다 네트워크 렉 방지)."""
+        sid = self.detail_sid
+        if not sid:
+            return
+        try:
+            sp = get_paper_storage_path(sid)
+        except Exception:
+            sp = None
+        if sp:
+            try:
+                from supabase_storage import create_signed_download
+                url = create_signed_download(sp)
+                if url:
+                    return rx.redirect(url, is_external=True)
+            except Exception:
+                pass
+            self.cond_status = "PDF 링크 생성 실패"
+            return
+        # 레거시 pdf_bytes → /_upload 서빙파일 적재 후 열기
+        try:
+            _materialize_pdf(sid)
+        except Exception:
+            pass
+        return rx.redirect(rx.get_upload_url(sid + ".pdf"), is_external=True)
 
     def _do_analysis(self, pdf: str, targets: list[str]) -> dict:
         """(스레드) 분석 실행 + papers/paper_analysis 저장."""
@@ -1430,14 +1463,8 @@ def _pdb_detail_panel() -> rx.Component:
                               spacing="2")),
             rx.cond(
                 State.has_pdf,
-                rx.cond(
-                    State.pdf_open_url != "",
-                    rx.link("🔗 이 PDB 의 논문 PDF 새 창에서 열기",
-                            href=State.pdf_open_url, is_external=True, size="2", weight="bold"),
-                    rx.link("🔗 이 PDB 의 논문 PDF 새 창에서 열기",
-                            href=rx.get_upload_url(State.detail_sid + ".pdf"),
-                            is_external=True, size="2", weight="bold"),
-                ),
+                rx.button("🔗 이 PDB 의 논문 PDF 새 창에서 열기", on_click=State.open_pdf,
+                          variant="ghost", size="2", weight="bold"),
             ),
             # papers 에만 있는 전체 분석 논문(PDF 유실 등) — PDF 없이 구조화 가능
             rx.cond(

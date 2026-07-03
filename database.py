@@ -643,9 +643,10 @@ def get_paper_analysis_shared(structure_id: str) -> dict | None:
             "ORDER BY (structure_id = :self) DESC LIMIT 1"
         ).bindparams(bindparam("sids", expanding=True))
         srow = conn.execute(q_struct, {"sids": sids, "self": structure_id}).mappings().first()
+        # PDF 는 pdf_bytes(레거시) 또는 pdf_storage_path(Storage) 중 하나면 있음
         q_pdf = text(
-            "SELECT structure_id, pdf_name FROM paper_analysis "
-            "WHERE structure_id IN :sids AND pdf_bytes IS NOT NULL "
+            "SELECT structure_id, pdf_name, pdf_storage_path FROM paper_analysis "
+            "WHERE structure_id IN :sids AND (pdf_bytes IS NOT NULL OR pdf_storage_path IS NOT NULL) "
             "ORDER BY (structure_id = :self) DESC LIMIT 1"
         ).bindparams(bindparam("sids", expanding=True))
         prow = conn.execute(q_pdf, {"sids": sids, "self": structure_id}).mappings().first()
@@ -656,24 +657,35 @@ def get_paper_analysis_shared(structure_id: str) -> dict | None:
         "status": (srow or {}).get("status") or ("uploaded" if prow else "none"),
         "pdf_name": (prow or {}).get("pdf_name"),
         "has_pdf": bool(prow),
+        "pdf_storage_path": (prow or {}).get("pdf_storage_path"),
         "pdf_owner": (prow or {}).get("structure_id"),
         "struct_owner": (srow or {}).get("structure_id"),
     }
 
 
 def get_paper_pdf_shared(structure_id: str) -> tuple[bytes | None, str | None]:
-    """DOI 공유 PDF 조회 — 형제 구조 중 PDF 보유분의 바이트 반환."""
+    """DOI 공유 PDF 조회 — 형제 구조 중 PDF 보유분의 바이트(레거시 또는 Storage) 반환."""
     with get_engine().connect() as conn:
         sids = _doi_group(conn, structure_id)
         q = text(
-            "SELECT pdf_bytes, pdf_name FROM paper_analysis "
-            "WHERE structure_id IN :sids AND pdf_bytes IS NOT NULL "
+            "SELECT pdf_bytes, pdf_name, pdf_storage_path FROM paper_analysis "
+            "WHERE structure_id IN :sids AND (pdf_bytes IS NOT NULL OR pdf_storage_path IS NOT NULL) "
             "ORDER BY (structure_id = :self) DESC LIMIT 1"
         ).bindparams(bindparam("sids", expanding=True))
-        row = conn.execute(q, {"sids": sids, "self": structure_id}).first()
-    if not row or row[0] is None:
+        row = conn.execute(q, {"sids": sids, "self": structure_id}).mappings().first()
+    if not row:
         return None, None
-    return bytes(row[0]), row[1]
+    if row["pdf_bytes"] is not None:
+        return bytes(row["pdf_bytes"]), row["pdf_name"]
+    if row["pdf_storage_path"]:
+        try:
+            from supabase_storage import download_bytes
+            data = download_bytes(row["pdf_storage_path"])
+            if data:
+                return bytes(data), row["pdf_name"]
+        except Exception:
+            pass
+    return None, row["pdf_name"]
 
 
 def upsert_paper_conditions(structure_id: str, conditions: dict, status: str = "completed"):
