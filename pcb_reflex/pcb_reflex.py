@@ -1773,14 +1773,19 @@ def _pg_tree_row(pg: dict) -> rx.Component:
     return rx.hstack(
         rx.box(width=pg["indent_px"], flex_shrink="0"),
         rx.button(
-            rx.icon(rx.cond(pg["has_digest"], "book-check", "message-square"), size=13),
-            rx.text(pg["name"], size="1", no_of_lines=1),
+            rx.icon(rx.cond(pg["has_digest"], "book-check", "message-square"),
+                    size=13, flex_shrink="0"),
+            rx.text(pg["name"], size="1", flex_grow="1", min_width="0",
+                    style={"whiteSpace": "nowrap", "overflow": "hidden",
+                           "textOverflow": "ellipsis", "textAlign": "left"}),
             rx.cond(pg["n_messages"].to(int) > 0,
-                    rx.badge(pg["n_messages"].to_string(), size="1", variant="soft")),
+                    rx.badge(pg["n_messages"].to_string(), size="1",
+                             variant="soft", flex_shrink="0")),
             variant=rx.cond(pg["is_active"], "solid", "soft"),
             color_scheme=rx.cond(pg["is_active"], "iris", "gray"),
             on_click=State.open_playground(pg["id"]),
-            size="1", justify="start", flex_grow="1", overflow="hidden",
+            size="1", justify="start", flex_grow="1", flex_shrink="1",
+            min_width="0", overflow="hidden",
         ),
         _new_pg_dialog(
             rx.icon_button("plus", size="1", variant="ghost", color_scheme="gray",
