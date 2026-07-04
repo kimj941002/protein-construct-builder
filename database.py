@@ -1039,10 +1039,9 @@ def delete_paper(structure_id: str) -> dict:
         except Exception:
             pass
     with get_engine().begin() as conn:
-        conn.execute(text(
-            "UPDATE paper_analysis SET pdf_bytes=NULL, pdf_name=NULL, pdf_storage_path=NULL, "
-            "structured=NULL, raw_text=NULL, status='none' WHERE structure_id = :sid"
-        ), {"sid": structure_id})
+        # paper_analysis 행을 실제로 삭제(NULL 로만 비우면 목록에 유령 항목으로 남아 되살아남)
+        conn.execute(text("DELETE FROM paper_analysis WHERE structure_id = :sid"),
+                     {"sid": structure_id})
         conn.execute(text("DELETE FROM papers WHERE structure_id = :sid"), {"sid": structure_id})
     return {"ok": True}
 
@@ -1064,9 +1063,12 @@ def get_papers_unified(uniprot_id: str) -> list[dict]:
         arows = conn.execute(text("""
             SELECT pa.structure_id, pa.pdf_name, ps.doi AS doi,
                    (pa.structured IS NOT NULL) AS has_structured,
-                   (pa.pdf_bytes IS NOT NULL)  AS has_pdf
+                   (pa.pdf_bytes IS NOT NULL OR pa.pdf_storage_path IS NOT NULL) AS has_pdf
             FROM paper_analysis pa JOIN pdb_structures ps ON pa.structure_id = ps.structure_id
             WHERE ps.uniprot_id = :uid
+              -- 내용이 있는 행만(삭제 후 NULL 로 남은 유령 행 제외)
+              AND (pa.pdf_bytes IS NOT NULL OR pa.pdf_storage_path IS NOT NULL
+                   OR pa.structured IS NOT NULL)
         """), {"uid": uniprot_id}).mappings().all()
 
     # DOI 있으면 doi 키, 없으면 structure_id 키로 그룹핑
