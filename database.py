@@ -1022,6 +1022,31 @@ def get_clinical_drug_names(uniprot_id: str) -> list[dict]:
     return _jsonable(rows)
 
 
+def delete_paper(structure_id: str) -> dict:
+    """이 PDB 의 업로드 논문 삭제 — paper_analysis PDF(bytes/storage/name/structured) 초기화 +
+    Storage 객체 제거 + papers 행 삭제. (요청: 기존 업로드 논문도 삭제 가능)"""
+    removed_storage = None
+    with get_engine().connect() as conn:
+        row = conn.execute(text(
+            "SELECT pdf_storage_path FROM paper_analysis WHERE structure_id = :sid"
+        ), {"sid": structure_id}).first()
+        removed_storage = row[0] if row else None
+    # Storage 객체 삭제(있으면)
+    if removed_storage:
+        try:
+            from supabase_storage import _client, BUCKET
+            _client().storage.from_(BUCKET).remove([removed_storage])
+        except Exception:
+            pass
+    with get_engine().begin() as conn:
+        conn.execute(text(
+            "UPDATE paper_analysis SET pdf_bytes=NULL, pdf_name=NULL, pdf_storage_path=NULL, "
+            "structured=NULL, raw_text=NULL, status='none' WHERE structure_id = :sid"
+        ), {"sid": structure_id})
+        conn.execute(text("DELETE FROM papers WHERE structure_id = :sid"), {"sid": structure_id})
+    return {"ok": True}
+
+
 def get_papers_unified(uniprot_id: str) -> list[dict]:
     """이 단백질의 논문을 한 목록으로 통합하되, **같은 DOI 는 한 항목으로 묶는다**.
 

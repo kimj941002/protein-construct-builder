@@ -830,6 +830,27 @@ class State(rx.State):
             pass
         return rx.redirect(rx.get_upload_url(sid + ".pdf"), is_external=True)
 
+    @rx.event
+    def delete_paper_event(self, sids):
+        """업로드 논문 삭제(PDF·구조화·Storage·papers) → 목록 갱신. [요청: 기존 논문 삭제]"""
+        from database import delete_paper
+        try:
+            for sid in (sids or []):
+                delete_paper(sid)
+        except Exception:
+            pass
+        # 목록 갱신 + 현재 세부 패널 반영
+        try:
+            self.paper_list = get_papers_unified(self.selected_uid)
+        except Exception:
+            pass
+        if self.detail_sid and self.detail_sid in (sids or []):
+            self.has_pdf = False
+            self.has_storage_pdf = False
+            self.uploaded_name = ""
+            self.pdb_conditions = {}
+            self.has_conditions = False
+
     def _do_analysis(self, pdf: str, targets: list[str]) -> dict:
         """(스레드) 분석 실행 + papers/paper_analysis 저장."""
         from datetime import datetime
@@ -1259,6 +1280,28 @@ def _paper_card(p: dict) -> rx.Component:
                     rx.cond(p["has_pdf"],
                             rx.badge("PDF 업로드됨", color_scheme="gray", size="1"),
                             rx.badge("전체 분석", color_scheme="blue", variant="soft", size="1"))),
+            rx.alert_dialog.root(
+                rx.alert_dialog.trigger(
+                    rx.icon_button("trash-2", size="1", variant="ghost",
+                                   color_scheme="red", title="이 논문 삭제"),
+                ),
+                rx.alert_dialog.content(
+                    rx.alert_dialog.title("논문 삭제"),
+                    rx.alert_dialog.description(
+                        "이 논문의 업로드 PDF·구조화 분석·연결을 삭제합니다. "
+                        "같은 DOI 로 묶인 PDB 전체에서 제거됩니다.",
+                        size="2",
+                    ),
+                    rx.flex(
+                        rx.alert_dialog.cancel(
+                            rx.button("취소", variant="soft", color_scheme="gray")),
+                        rx.alert_dialog.action(
+                            rx.button("삭제", color_scheme="red",
+                                      on_click=State.delete_paper_event(p["structure_ids"].to(list)))),
+                        spacing="3", justify="end", margin_top="1rem",
+                    ),
+                ),
+            ),
             width="100%", align="center", spacing="2", wrap="wrap",
         ),
         rx.hstack(
@@ -1650,7 +1693,7 @@ def _results_view() -> rx.Component:
                               spacing="1", align="center"),
                     value="bio"),
                 rx.tabs.trigger(
-                    rx.hstack(rx.text("논문"),
+                    rx.hstack(rx.text("문헌"),
                               rx.badge(State.paper_count.to_string(), size="1"),
                               spacing="1", align="center"),
                     value="papers"),
