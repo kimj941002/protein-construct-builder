@@ -47,6 +47,8 @@ from database import (
 )
 from uniprot_fetcher import load_sequence_from_file
 from collect import collect_protein
+import playground_db as pgdb
+import playground_llm as pgllm
 
 
 def _warm_db():
@@ -223,6 +225,28 @@ class State(rx.State):
     # 논문 (단백질 단위 통합 — papers + paper_analysis 병합 단일 목록)
     paper_list: list[dict] = []
 
+    # ── 문헌 Playground (Claude 연구공간) ──
+    playgrounds: list[dict] = []        # 현재 단백질의 전체 Playground(트리, parent_id 포함)
+    active_pg_id: int = 0               # 열려 있는 Playground id (0=목록 화면)
+    pg_name: str = ""                   # 열린 Playground 이름
+    pg_parent_id: int = 0              # 열린 Playground 의 부모(0=최상위) — 브레드크럼용
+    pg_messages: list[dict] = []        # raw 대화
+    pg_digest: str = ""                 # 정리본
+    pg_digest_updated: str = ""
+    pg_papers: list[dict] = []          # 연결 문헌
+    pg_input: str = ""                  # 채팅 입력
+    pg_chatting: bool = False           # 답변 생성 중
+    pg_summarizing: bool = False        # 정리본 생성 중
+    pg_show_raw: bool = False           # raw 대화 펼침 여부
+    pg_status: str = ""                 # 상태 메시지
+    # 새 주제 / 이름수정 다이얼로그
+    new_pg_name: str = ""
+    new_pg_parent: int = 0             # 0=최상위, >0=하위 생성 대상 부모
+    rename_pg_value: str = ""
+    # 문헌 참조 추가(제목/DOI) 입력
+    pg_paper_title: str = ""
+    pg_paper_doi: str = ""
+
     @rx.var
     def drug_count(self) -> int:
         return len(self.drug_rows)
@@ -238,6 +262,38 @@ class State(rx.State):
     @rx.var
     def paper_count(self) -> int:
         return len(self.paper_list)
+
+    @rx.var
+    def pg_count(self) -> int:
+        return len(self.playgrounds)
+
+    @rx.var
+    def pg_tree(self) -> list[dict]:
+        """Playground 를 트리 DFS 순서로 평탄화 + depth(들여쓰기용). 각 항목에 indent_px 추가."""
+        by_parent: dict[int, list[dict]] = {}
+        for pg in self.playgrounds:
+            by_parent.setdefault(pg.get("parent_id", 0) or 0, []).append(pg)
+        out: list[dict] = []
+
+        def walk(parent_id: int, depth: int):
+            for pg in by_parent.get(parent_id, []):
+                d = dict(pg)
+                d["depth"] = depth
+                d["indent_px"] = f"{depth * 16}px"
+                d["is_active"] = pg["id"] == self.active_pg_id
+                out.append(d)
+                walk(pg["id"], depth + 1)
+
+        walk(0, 0)
+        return out
+
+    @rx.var
+    def pg_has_digest(self) -> bool:
+        return bool(self.pg_digest.strip())
+
+    @rx.var
+    def pg_msg_count(self) -> int:
+        return len(self.pg_messages)
 
     @rx.var
     def mutation_count(self) -> int:
@@ -372,6 +428,13 @@ class State(rx.State):
         except Exception:
             self.paper_list = []
 
+        # 문헌 Playground 목록 + 열린 Playground 초기화
+        try:
+            self.playgrounds = pgdb.list_playgrounds(uid)
+        except Exception:
+            self.playgrounds = []
+        self._reset_playground_view()
+
         # 세부 패널 초기화
         self.detail_sid = ""
         self.detail = {}
@@ -459,6 +522,31 @@ class State(rx.State):
     @rx.event
     def set_query(self, value: str):
         self.query = value
+
+    # Playground 입력 setter (Reflex 명시적 setter 필요)
+    @rx.event
+    def set_new_pg_name(self, value: str):
+        self.new_pg_name = value
+
+    @rx.event
+    def set_new_pg_parent(self, value: int):
+        self.new_pg_parent = int(value or 0)
+
+    @rx.event
+    def set_pg_input(self, value: str):
+        self.pg_input = value
+
+    @rx.event
+    def set_rename_pg_value(self, value: str):
+        self.rename_pg_value = value
+
+    @rx.event
+    def set_pg_paper_title(self, value: str):
+        self.pg_paper_title = value
+
+    @rx.event
+    def set_pg_paper_doi(self, value: str):
+        self.pg_paper_doi = value
 
     @rx.event
     def load_collected(self):
@@ -850,6 +938,249 @@ class State(rx.State):
             self.uploaded_name = ""
             self.pdb_conditions = {}
             self.has_conditions = False
+
+    # ══════════════════════════════════════════════
+    # 문헌 Playground (Claude 연구공간)
+    # ══════════════════════════════════════════════
+    def _reset_playground_view(self):
+        """열린 Playground 상태 초기화(목록 화면으로)."""
+        self.active_pg_id = 0
+        self.pg_name = ""
+        self.pg_parent_id = 0
+        self.pg_messages = []
+        self.pg_digest = ""
+        self.pg_digest_updated = ""
+        self.pg_papers = []
+        self.pg_input = ""
+        self.pg_show_raw = False
+        self.pg_status = ""
+
+    def _reload_playgrounds(self):
+        try:
+            self.playgrounds = pgdb.list_playgrounds(self.selected_uid)
+        except Exception:
+            self.playgrounds = []
+
+    @rx.event
+    def create_playground_event(self):
+        """새 주제(또는 하위 주제) 생성. new_pg_name/new_pg_parent 사용."""
+        name = (self.new_pg_name or "").strip()
+        if not name or not self.selected_uid:
+            return
+        parent = self.new_pg_parent or None
+        try:
+            pid = pgdb.create_playground(self.selected_uid, name, parent_id=parent)
+        except Exception as e:
+            self.pg_status = f"생성 실패: {e}"
+            return
+        self.new_pg_name = ""
+        self.new_pg_parent = 0
+        self._reload_playgrounds()
+        if pid:
+            self._open_playground(pid)
+
+    def _open_playground(self, pid: int):
+        g = None
+        try:
+            g = pgdb.get_playground(pid)
+        except Exception:
+            g = None
+        if not g:
+            return
+        self.active_pg_id = pid
+        self.pg_name = g["name"]
+        self.pg_parent_id = g.get("parent_id", 0) or 0
+        self.pg_digest = g.get("digest", "") or ""
+        self.pg_digest_updated = g.get("digest_updated_at", "") or ""
+        try:
+            self.pg_messages = pgdb.get_messages(pid)
+        except Exception:
+            self.pg_messages = []
+        try:
+            self.pg_papers = pgdb.list_playground_papers(pid)
+        except Exception:
+            self.pg_papers = []
+        # 정리본 있으면 raw 접힘, 없으면 펼침
+        self.pg_show_raw = not bool(self.pg_digest.strip())
+        self.pg_input = ""
+        self.pg_status = ""
+
+    @rx.event
+    def open_playground(self, pid: int):
+        self._open_playground(pid)
+
+    @rx.event
+    def close_playground(self):
+        self._reset_playground_view()
+
+    @rx.event
+    def toggle_pg_raw(self):
+        self.pg_show_raw = not self.pg_show_raw
+
+    @rx.event
+    def rename_playground_event(self):
+        name = (self.rename_pg_value or "").strip()
+        if not name or not self.active_pg_id:
+            return
+        try:
+            pgdb.rename_playground(self.active_pg_id, name)
+        except Exception:
+            return
+        self.pg_name = name
+        self.rename_pg_value = ""
+        self._reload_playgrounds()
+
+    @rx.event
+    def delete_playground_event(self, pid: int):
+        try:
+            pgdb.delete_playground(pid)
+        except Exception:
+            pass
+        if pid == self.active_pg_id:
+            self._reset_playground_view()
+        self._reload_playgrounds()
+
+    @rx.event
+    def delete_pg_message_event(self, mid: int):
+        try:
+            pgdb.delete_message(mid)
+        except Exception:
+            pass
+        if self.active_pg_id:
+            try:
+                self.pg_messages = pgdb.get_messages(self.active_pg_id)
+            except Exception:
+                pass
+
+    def _do_pg_chat(self, pid: int) -> str:
+        """(스레드) 연결 문헌 컨텍스트 조립 + Claude 답변 생성."""
+        try:
+            history = pgdb.get_messages(pid)
+            ctx = self._pg_context(pid)
+            return pgllm.run_chat(history, extra_context=ctx)
+        except Exception as e:
+            return f"(오류: 답변 생성 실패 — {e})"
+
+    def _pg_context(self, pid: int) -> str:
+        """연결 문헌 + 매칭된 PDB/약물 팩트를 텍스트 컨텍스트로 조립 (P5)."""
+        lines: list[str] = []
+        try:
+            papers = pgdb.list_playground_papers(pid)
+        except Exception:
+            papers = []
+        for p in papers:
+            tag = f"- 문헌: {p['title']}"
+            if p["doi"]:
+                tag += f" (DOI: {p['doi']})"
+            if p.get("matched_structure_id"):
+                tag += f" → DB 매칭 PDB: {p['matched_structure_id']}"
+                fa = get_paper_by_structure(p["matched_structure_id"])
+                if fa and fa.get("analysis_md"):
+                    tag += "\n  [분석요약] " + str(fa["analysis_md"])[:1500]
+            lines.append(tag)
+        return "\n".join(lines)
+
+    @rx.event(background=True)
+    async def send_pg_message(self):
+        """사용자 메시지 → raw 누적 → Claude 답변 → raw 누적 → 화면 갱신."""
+        async with self:
+            pid = self.active_pg_id
+            text_in = (self.pg_input or "").strip()
+            if not pid or not text_in or self.pg_chatting:
+                return
+            self.pg_chatting = True
+            self.pg_input = ""
+            self.pg_status = "답변 생성 중…"
+            try:
+                pgdb.add_message(pid, "user", text_in)
+                self.pg_messages = pgdb.get_messages(pid)
+                self.pg_show_raw = True
+            except Exception:
+                pass
+        answer = await asyncio.to_thread(self._do_pg_chat, pid)
+        async with self:
+            try:
+                pgdb.add_message(pid, "assistant", answer)
+                self.pg_messages = pgdb.get_messages(pid)
+            except Exception:
+                pass
+            self.pg_chatting = False
+            self.pg_status = ""
+            self._reload_playgrounds()
+
+    @rx.event(background=True)
+    async def summarize_playground(self):
+        """수동 '정리' 버튼 → 대화 전체를 체계적 정리본(digest)으로 재생성(Sonnet)."""
+        async with self:
+            pid = self.active_pg_id
+            if not pid or self.pg_summarizing:
+                return
+            if not self.pg_messages:
+                self.pg_status = "정리할 대화가 없습니다."
+                return
+            self.pg_summarizing = True
+            self.pg_status = "정리본 생성 중…"
+        digest = ""
+        try:
+            history = await asyncio.to_thread(pgdb.get_messages, pid)
+            digest = await asyncio.to_thread(pgllm.generate_digest, history)
+        except Exception as e:
+            digest = ""
+            err = str(e)
+        async with self:
+            if digest.strip():
+                try:
+                    pgdb.update_digest(pid, digest)
+                except Exception:
+                    pass
+                self.pg_digest = digest
+                g = pgdb.get_playground(pid)
+                self.pg_digest_updated = g.get("digest_updated_at", "") if g else ""
+                self.pg_show_raw = False
+                self.pg_status = "정리 완료"
+                self._reload_playgrounds()
+            else:
+                self.pg_status = "정리본 생성 실패"
+            self.pg_summarizing = False
+
+    @rx.event
+    def add_pg_paper_ref(self):
+        """제목/DOI 로 문헌 참조 추가 + DB 매칭 시도."""
+        pid = self.active_pg_id
+        title = (self.pg_paper_title or "").strip()
+        doi = (self.pg_paper_doi or "").strip()
+        if not pid or not (title or doi):
+            return
+        try:
+            paper_id = pgdb.add_playground_paper(pid, title or doi, doi=doi)
+            m = pgdb.match_paper_to_db(self.selected_uid, title=title, doi=doi)
+            if m and paper_id:
+                pgdb.set_paper_match(paper_id, m["structure_id"])
+            self.pg_papers = pgdb.list_playground_papers(pid)
+            self.pg_status = ("DB 논문과 매칭됨: " + m["structure_id"]) if m else "문헌 추가됨(매칭 없음)"
+        except Exception as e:
+            self.pg_status = f"문헌 추가 실패: {e}"
+        self.pg_paper_title = ""
+        self.pg_paper_doi = ""
+
+    @rx.event
+    def delete_pg_paper_event(self, paper_id: int):
+        try:
+            pgdb.delete_playground_paper(paper_id)
+        except Exception:
+            pass
+        if self.active_pg_id:
+            try:
+                self.pg_papers = pgdb.list_playground_papers(self.active_pg_id)
+            except Exception:
+                pass
+
+    @rx.event
+    def open_matched_structure(self, sid: str):
+        """연결 문헌의 매칭 PDB 클릭 → PDB 구조 탭으로 이동 (유기적 연결)."""
+        if sid:
+            self._load_detail(sid)
+            self.active_tab = "pdb"
 
     def _do_analysis(self, pdf: str, targets: list[str]) -> dict:
         """(스레드) 분석 실행 + papers/paper_analysis 저장."""
@@ -1318,7 +1649,8 @@ def _paper_card(p: dict) -> rx.Component:
     )
 
 
-def _papers_view() -> rx.Component:
+def _uploaded_papers_view() -> rx.Component:
+    """기존 업로드 논문 목록(삭제 가능) — PDB 세부에서 업로드된 것."""
     return rx.cond(
         State.paper_count > 0,
         rx.vstack(
@@ -1332,6 +1664,269 @@ def _papers_view() -> rx.Component:
             "이 단백질에 연결된 논문이 아직 없습니다. 'PDB 구조' 탭에서 PDB 를 선택하고 논문 PDF 를 업로드하세요.",
             icon="info", color_scheme="gray",
         ),
+    )
+
+
+# ══════════════════════════════════════════════════════════════════
+# 문헌 Playground UI (Claude 연구공간)
+# ══════════════════════════════════════════════════════════════════
+def _new_pg_dialog(trigger: rx.Component) -> rx.Component:
+    """주제/하위주제 생성 다이얼로그. trigger 버튼이 new_pg_parent 를 먼저 세팅한다."""
+    return rx.dialog.root(
+        rx.dialog.trigger(trigger),
+        rx.dialog.content(
+            rx.dialog.title("연구 주제(Playground) 생성"),
+            rx.dialog.description(
+                "이 단백질을 주제로 한 연구 공간을 만듭니다. 대화가 raw 로 누적되고 "
+                "'정리' 버튼으로 정리본이 생성됩니다.", size="1", color=rx.color("gray", 10)),
+            rx.input(placeholder="예: cMET 저해제 내성 변이 SAR",
+                     value=State.new_pg_name, on_change=State.set_new_pg_name,
+                     margin_top="0.7rem"),
+            rx.flex(
+                rx.dialog.close(rx.button("취소", variant="soft", color_scheme="gray",
+                                          on_click=State.set_new_pg_name(""))),
+                rx.dialog.close(rx.button("생성", on_click=State.create_playground_event)),
+                spacing="3", justify="end", margin_top="1rem",
+            ),
+            max_width="420px",
+        ),
+    )
+
+
+def _pg_tree_row(pg: dict) -> rx.Component:
+    """Playground 트리 한 줄 — 들여쓰기(depth), 열기, ＋하위, 삭제."""
+    return rx.hstack(
+        rx.box(width=pg["indent_px"], flex_shrink="0"),
+        rx.button(
+            rx.icon(rx.cond(pg["has_digest"], "book-check", "message-square"), size=13),
+            rx.text(pg["name"], size="1", no_of_lines=1),
+            rx.cond(pg["n_messages"].to(int) > 0,
+                    rx.badge(pg["n_messages"].to_string(), size="1", variant="soft")),
+            variant=rx.cond(pg["is_active"], "solid", "soft"),
+            color_scheme=rx.cond(pg["is_active"], "iris", "gray"),
+            on_click=State.open_playground(pg["id"]),
+            size="1", justify="start", flex_grow="1", overflow="hidden",
+        ),
+        _new_pg_dialog(
+            rx.icon_button("plus", size="1", variant="ghost", color_scheme="gray",
+                           title="하위 주제 추가",
+                           on_click=State.set_new_pg_parent(pg["id"])),
+        ),
+        rx.alert_dialog.root(
+            rx.alert_dialog.trigger(
+                rx.icon_button("trash-2", size="1", variant="ghost",
+                               color_scheme="red", title="주제 삭제")),
+            rx.alert_dialog.content(
+                rx.alert_dialog.title("주제 삭제"),
+                rx.alert_dialog.description(
+                    "이 주제와 하위 주제·대화·연결 문헌이 모두 삭제됩니다.", size="2"),
+                rx.flex(
+                    rx.alert_dialog.cancel(rx.button("취소", variant="soft", color_scheme="gray")),
+                    rx.alert_dialog.action(rx.button("삭제", color_scheme="red",
+                                                     on_click=State.delete_playground_event(pg["id"]))),
+                    spacing="3", justify="end", margin_top="1rem"),
+            ),
+        ),
+        width="100%", spacing="1", align="center",
+    )
+
+
+def _pg_left_panel() -> rx.Component:
+    return rx.vstack(
+        _new_pg_dialog(
+            rx.button(rx.icon("plus", size=14), "주제 생성", size="1",
+                      width="100%", on_click=State.set_new_pg_parent(0)),
+        ),
+        rx.cond(
+            State.pg_count > 0,
+            rx.vstack(rx.foreach(State.pg_tree, _pg_tree_row),
+                      spacing="1", width="100%", align="start"),
+            rx.text("아직 주제가 없습니다. '주제 생성'으로 시작하세요.",
+                    size="1", color=rx.color("gray", 9)),
+        ),
+        spacing="2", width="260px", flex_shrink="0", align="start",
+    )
+
+
+def _pg_message(m: dict) -> rx.Component:
+    is_user = m["role"] == "user"
+    return rx.box(
+        rx.hstack(
+            rx.badge(rx.cond(is_user, "나", "조수"),
+                     color_scheme=rx.cond(is_user, "gray", "iris"), size="1"),
+            rx.spacer(),
+            rx.icon_button("trash-2", size="1", variant="ghost", color_scheme="gray",
+                           title="메시지 삭제",
+                           on_click=State.delete_pg_message_event(m["id"])),
+            width="100%", align="center",
+        ),
+        rx.markdown(m["content"]),
+        background=rx.cond(is_user, rx.color("gray", 3), rx.color("iris", 2)),
+        border="1px solid var(--gray-4)", border_radius="10px",
+        padding="0.4rem 0.7rem", width="100%",
+    )
+
+
+def _pg_paper_ref(p: dict) -> rx.Component:
+    return rx.hstack(
+        rx.icon("file-text", size=13, color=rx.color("gray", 10)),
+        rx.text(p["title"], size="1", no_of_lines=1, flex_grow="1"),
+        rx.cond(p["matched"],
+                rx.button(p["matched_structure_id"], size="1", variant="soft",
+                          color_scheme="green",
+                          on_click=State.open_matched_structure(p["matched_structure_id"]),
+                          title="매칭된 PDB 구조로 이동"),
+                rx.badge("매칭 없음", size="1", color_scheme="gray", variant="surface")),
+        rx.icon_button("x", size="1", variant="ghost", color_scheme="gray",
+                       on_click=State.delete_pg_paper_event(p["id"])),
+        width="100%", spacing="2", align="center",
+    )
+
+
+def _pg_papers_panel() -> rx.Component:
+    return rx.vstack(
+        rx.text("연결 문헌 (DB 논문과 매칭 시 PDB·약물 연결)", size="1", weight="bold",
+                color=rx.color("gray", 11)),
+        rx.cond(State.pg_papers.length() > 0,
+                rx.vstack(rx.foreach(State.pg_papers, _pg_paper_ref),
+                          spacing="1", width="100%")),
+        rx.hstack(
+            rx.input(placeholder="문헌 제목", value=State.pg_paper_title,
+                     on_change=State.set_pg_paper_title, size="1", flex_grow="1"),
+            rx.input(placeholder="DOI(선택)", value=State.pg_paper_doi,
+                     on_change=State.set_pg_paper_doi, size="1", width="140px"),
+            rx.button("추가", size="1", variant="soft",
+                      on_click=State.add_pg_paper_ref),
+            width="100%", spacing="2", align="center", wrap="wrap",
+        ),
+        spacing="2", width="100%", align="start",
+        border="1px solid var(--gray-4)", border_radius="10px", padding="0.7rem",
+    )
+
+
+def _pg_active_panel() -> rx.Component:
+    """열린 Playground — 정리본(메인) + 접힌 raw 대화 + 입력창 + 연결문헌."""
+    return rx.vstack(
+        # 헤더: 이름·브레드크럼·정리/이름수정
+        rx.hstack(
+            rx.icon_button("arrow-left", size="1", variant="ghost",
+                           on_click=State.close_playground, title="목록으로"),
+            rx.icon("book-open", size=16, color=rx.color("iris", 10)),
+            rx.heading(State.pg_name, size="4"),
+            rx.spacer(),
+            rx.button(
+                rx.cond(State.pg_summarizing, rx.spinner(), rx.icon("sparkles", size=14)),
+                "정리", size="1", variant="soft", color_scheme="iris",
+                on_click=State.summarize_playground,
+                disabled=State.pg_summarizing | (State.pg_msg_count == 0),
+                title="대화 전체를 체계적 정리본으로 재생성(Sonnet)"),
+            _new_pg_dialog(
+                rx.button(rx.icon("git-branch-plus", size=14), "하위 주제", size="1",
+                          variant="soft", color_scheme="gray",
+                          on_click=State.set_new_pg_parent(State.active_pg_id))),
+            width="100%", align="center", spacing="2", wrap="wrap",
+        ),
+        rx.cond(State.pg_status != "",
+                rx.text(State.pg_status, size="1", color=rx.color("iris", 10))),
+
+        # 정리본(digest) — 메인 뷰
+        rx.cond(
+            State.pg_has_digest,
+            rx.box(
+                rx.hstack(
+                    rx.icon("book-check", size=14, color=rx.color("green", 10)),
+                    rx.text("정리본", size="2", weight="bold"),
+                    rx.cond(State.pg_digest_updated != "",
+                            rx.text(State.pg_digest_updated, size="1", color=rx.color("gray", 9))),
+                    align="center", spacing="2",
+                ),
+                rx.markdown(State.pg_digest),
+                background=rx.color("green", 2), border="1px solid var(--green-4)",
+                border_radius="10px", padding="0.7rem 0.9rem", width="100%",
+            ),
+            rx.callout("아직 정리본이 없습니다. 대화 후 '정리' 버튼을 누르면 지금까지 다룬 내용을 "
+                       "체계적으로 정리합니다.", icon="info", color_scheme="gray", size="1"),
+        ),
+
+        # 연결 문헌 패널
+        _pg_papers_panel(),
+
+        # raw 대화 (접힘/펼침)
+        rx.hstack(
+            rx.button(
+                rx.icon(rx.cond(State.pg_show_raw, "chevron-down", "chevron-right"), size=14),
+                rx.cond(State.pg_show_raw, "대화 접기", "대화 펼치기 (raw)"),
+                rx.badge(State.pg_msg_count.to_string(), size="1", variant="soft"),
+                size="1", variant="ghost", color_scheme="gray",
+                on_click=State.toggle_pg_raw),
+            width="100%", align="center",
+        ),
+        rx.cond(
+            State.pg_show_raw,
+            rx.vstack(rx.foreach(State.pg_messages, _pg_message),
+                      spacing="2", width="100%"),
+        ),
+
+        # 입력창
+        rx.hstack(
+            rx.text_area(
+                placeholder="질문을 입력하세요 (Shift+Enter 줄바꿈). 앱 DB·문헌·인터넷을 활용해 분석을 요청할 수 있습니다.",
+                value=State.pg_input, on_change=State.set_pg_input,
+                flex_grow="1", rows="2", auto_height=True),
+            rx.button(
+                rx.cond(State.pg_chatting, rx.spinner(), rx.icon("send", size=14)),
+                "전송", on_click=State.send_pg_message,
+                disabled=State.pg_chatting, size="2"),
+            width="100%", spacing="2", align="end",
+        ),
+        spacing="3", width="100%", align="start", flex_grow="1",
+    )
+
+
+def _playground_section() -> rx.Component:
+    return rx.hstack(
+        _pg_left_panel(),
+        rx.box(
+            rx.cond(
+                State.active_pg_id > 0,
+                _pg_active_panel(),
+                rx.center(
+                    rx.vstack(
+                        rx.icon("book-open", size=40, color=rx.color("gray", 7)),
+                        rx.text("연구 주제(Playground)를 선택하거나 새로 만드세요.",
+                                size="2", color=rx.color("gray", 10)),
+                        rx.text("Claude 와 대화하며 이 단백질을 연구하고, 대화를 정리본으로 축적합니다.",
+                                size="1", color=rx.color("gray", 9)),
+                        spacing="2", align="center",
+                    ),
+                    min_height="300px", width="100%",
+                ),
+            ),
+            flex_grow="1", border="1px solid var(--gray-4)", border_radius="12px",
+            padding="0.9rem", min_height="360px",
+        ),
+        width="100%", align="start", spacing="3",
+    )
+
+
+def _papers_view() -> rx.Component:
+    """문헌 탭 — Playground(연구공간)가 메인 + 업로드 논문 목록(접힘)."""
+    return rx.vstack(
+        _playground_section(),
+        rx.divider(margin_y="0.5rem"),
+        rx.accordion.root(
+            rx.accordion.item(
+                header=rx.hstack(
+                    rx.icon("files", size=15),
+                    rx.text("업로드된 논문 목록", size="2", weight="medium"),
+                    rx.badge(State.paper_count.to_string(), size="1"),
+                    spacing="2", align="center"),
+                content=rx.box(_uploaded_papers_view(), padding_top="0.7rem"),
+                value="uploaded",
+            ),
+            collapsible=True, type="single", width="100%", variant="ghost",
+        ),
+        spacing="3", width="100%", align="start",
     )
 
 
