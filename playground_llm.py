@@ -41,26 +41,66 @@ def _text_of(msg) -> str:
     return "\n".join(parts).strip()
 
 
-def run_chat(history: list[dict], extra_context: str = "",
-             model: str = CHAT_MODEL, max_tokens: int = 4000) -> str:
-    """대화 히스토리(raw) → 조수 답변 텍스트.
+def _blocks_to_text(content) -> str:
+    return "\n".join(b.text for b in content
+                     if getattr(b, "type", "") == "text").strip()
+
+
+def run_chat(history: list[dict], extra_context: str = "", uniprot_id: str = "",
+             model: str = CHAT_MODEL, max_tokens: int = 4000,
+             enable_tools: bool = True) -> str:
+    """대화 히스토리(raw) → 조수 답변 텍스트. 강력 권한(§8): web_search + 앱 DB 조회 툴.
 
     history: [{"role":"user"|"assistant", "content": str}, ...] (마지막이 방금 user 메시지).
     extra_context: 연결 문헌·DB 팩트 등 시스템에 주입할 추가 컨텍스트(P5).
+    uniprot_id: 현재 단백질(DB 조회 힌트).
     """
     msgs = [{"role": m["role"], "content": m["content"]}
             for m in history if m.get("content")]
     if not msgs:
         return "(질문이 비어 있습니다.)"
     system = _SYS_CHAT
+    if uniprot_id:
+        system += (f"\n\n현재 연구 대상 단백질: uniprot_id = '{uniprot_id}'. "
+                   "앱 DB 조회 시 이 값으로 필터하세요.")
     if extra_context.strip():
         system += "\n\n[연결된 문헌·DB 컨텍스트]\n" + extra_context.strip()[:20000]
+
     client = _client()
-    msg = client.messages.create(
-        model=model, max_tokens=max_tokens, system=system, messages=msgs,
-    )
-    out = _text_of(msg)
-    return out or "(답변을 생성하지 못했습니다.)"
+    if not enable_tools:
+        msg = client.messages.create(model=model, max_tokens=max_tokens,
+                                      system=system, messages=msgs)
+        return _blocks_to_text(msg.content) or "(답변을 생성하지 못했습니다.)"
+
+    # 강력 권한: 인터넷(web_search 서버툴) + 앱 DB(read-only 조회툴)
+    from db_tools import DB_QUERY_TOOL, run_readonly_sql
+    tools = [
+        {"type": "web_search_20250305", "name": "web_search", "max_uses": 5},
+        DB_QUERY_TOOL,
+    ]
+    conv = list(msgs)
+    for _ in range(8):  # 최대 8라운드 툴 사용
+        resp = client.messages.create(model=model, max_tokens=max_tokens,
+                                       system=system, messages=conv, tools=tools)
+        if resp.stop_reason == "tool_use":
+            # 커스텀 툴(query_app_db) 실행. web_search 는 서버가 자동 처리.
+            tool_results = []
+            for block in resp.content:
+                if getattr(block, "type", "") == "tool_use" and block.name == "query_app_db":
+                    sql = (block.input or {}).get("sql", "")
+                    out = run_readonly_sql(sql)
+                    tool_results.append({"type": "tool_result",
+                                         "tool_use_id": block.id,
+                                         "content": out[:12000]})
+            conv.append({"role": "assistant", "content": resp.content})
+            if tool_results:
+                conv.append({"role": "user", "content": tool_results})
+            continue
+        if resp.stop_reason == "pause_turn":
+            conv.append({"role": "assistant", "content": resp.content})
+            continue
+        return _blocks_to_text(resp.content) or "(답변을 생성하지 못했습니다.)"
+    return "(툴 사용이 많아 응답을 마치지 못했습니다. 질문을 좁혀 다시 시도하세요.)"
 
 
 def generate_digest(history: list[dict], model: str = DIGEST_MODEL,

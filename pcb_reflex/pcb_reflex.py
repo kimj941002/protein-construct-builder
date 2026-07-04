@@ -1061,7 +1061,8 @@ class State(rx.State):
         try:
             history = pgdb.get_messages(pid)
             ctx = self._pg_context(pid)
-            return pgllm.run_chat(history, extra_context=ctx)
+            return pgllm.run_chat(history, extra_context=ctx,
+                                  uniprot_id=self.selected_uid)
         except Exception as e:
             return f"(오류: 답변 생성 실패 — {e})"
 
@@ -1900,6 +1901,22 @@ def _pg_active_panel() -> rx.Component:
                            on_click=State.close_playground, title="목록으로"),
             rx.icon("book-open", size=16, color=rx.color("iris", 10)),
             rx.heading(State.pg_name, size="4"),
+            rx.dialog.root(
+                rx.dialog.trigger(
+                    rx.icon_button("pencil", size="1", variant="ghost", color_scheme="gray",
+                                   title="이름 수정",
+                                   on_click=State.set_rename_pg_value(State.pg_name))),
+                rx.dialog.content(
+                    rx.dialog.title("주제 이름 수정"),
+                    rx.input(value=State.rename_pg_value,
+                             on_change=State.set_rename_pg_value, margin_top="0.5rem"),
+                    rx.flex(
+                        rx.dialog.close(rx.button("취소", variant="soft", color_scheme="gray")),
+                        rx.dialog.close(rx.button("저장", on_click=State.rename_playground_event)),
+                        spacing="3", justify="end", margin_top="1rem"),
+                    max_width="380px",
+                ),
+            ),
             rx.spacer(),
             rx.button(
                 rx.cond(State.pg_summarizing, rx.spinner(), rx.icon("sparkles", size=14)),
@@ -1959,7 +1976,7 @@ def _pg_active_panel() -> rx.Component:
             rx.text_area(
                 placeholder="질문을 입력하세요 (Shift+Enter 줄바꿈). 앱 DB·문헌·인터넷을 활용해 분석을 요청할 수 있습니다.",
                 value=State.pg_input, on_change=State.set_pg_input,
-                flex_grow="1", rows="2", auto_height=True),
+                flex_grow="1", rows="3"),
             rx.button(
                 rx.cond(State.pg_chatting, rx.spinner(), rx.icon("send", size=14)),
                 "전송", on_click=State.send_pg_message,
