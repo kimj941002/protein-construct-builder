@@ -246,6 +246,10 @@ class State(rx.State):
     # 문헌 참조 추가(제목/DOI) 입력
     pg_paper_title: str = ""
     pg_paper_doi: str = ""
+    # Playground 문헌 PDF 업로드(Storage 직접업로드)
+    _pending_pg_paper_path: str = ""
+    _pending_pg_paper_title: str = ""
+    pg_uploading: bool = False
 
     @rx.var
     def drug_count(self) -> int:
@@ -1164,6 +1168,76 @@ class State(rx.State):
         self.pg_paper_doi = ""
 
     @rx.event
+    def start_pg_paper_upload(self, value):
+        """Playground 문헌 PDF 를 Storage 로 직접 업로드(브라우저 PUT)."""
+        pid = self.active_pg_id
+        if not pid:
+            self.pg_status = "먼저 주제를 선택하세요."
+            return
+        raw = value if isinstance(value, str) else ""
+        fname = raw.replace("\\", "/").split("/")[-1] or "uploaded.pdf"
+        if fname and not fname.lower().endswith(".pdf"):
+            self.pg_status = "PDF 파일만 업로드할 수 있습니다."
+            return
+        try:
+            from supabase_storage import create_signed_upload, storage_path_for
+            path = storage_path_for(f"playground/{pid}", fname)
+            sig = create_signed_upload(path)
+            signed_url = sig.get("signed_url")
+            if not signed_url:
+                raise RuntimeError("서명 URL 생성 실패")
+        except Exception as ex:
+            self.pg_status = "업로드 준비 실패: " + str(ex)[:120]
+            return
+        self.pg_uploading = True
+        self._pending_pg_paper_path = path
+        self._pending_pg_paper_title = fname
+        self.pg_status = "문헌 업로드 중…"
+        js = (
+            "(async () => {"
+            "  const inp = document.getElementById('pg_paper_input');"
+            "  if (!inp || !inp.files || !inp.files[0]) return {error:'파일 없음'};"
+            "  try {"
+            "    const r = await fetch(" + repr(signed_url) + ", {"
+            "      method:'PUT', headers:{'x-upsert':'true'}, body: inp.files[0]"
+            "    });"
+            "    if (r.ok) return {ok:true};"
+            "    const t = await r.text();"
+            "    return {error:'HTTP '+r.status+' '+(t||'').slice(0,120)};"
+            "  } catch(e){ return {error:String(e)}; }"
+            "})()"
+        )
+        return rx.call_script(js, callback=State.on_pg_paper_upload_result)
+
+    @rx.event
+    def on_pg_paper_upload_result(self, result):
+        """업로드 검증 → playground_papers 저장 + 파일명↔DB 논문 매칭."""
+        self.pg_uploading = False
+        pid = self.active_pg_id
+        if isinstance(result, dict) and result.get("error"):
+            self.pg_status = "업로드 실패: " + str(result.get("error"))
+            return
+        try:
+            from supabase_storage import object_exists
+            if not self._pending_pg_paper_path or not object_exists(self._pending_pg_paper_path):
+                self.pg_status = "업로드 실패 — Storage 에서 파일이 확인되지 않습니다."
+                return
+            title = self._pending_pg_paper_title or "업로드 문헌.pdf"
+            paper_id = pgdb.add_playground_paper(pid, title, storage_path=self._pending_pg_paper_path)
+            # 파일명으로 DB 논문 매칭 시도(요구4: 업로드 문헌명 ↔ DB 논문명 대조)
+            m = pgdb.match_paper_to_db(self.selected_uid, title=title)
+            if m and paper_id:
+                pgdb.set_paper_match(paper_id, m["structure_id"])
+            self.pg_papers = pgdb.list_playground_papers(pid)
+            self.pg_status = ("업로드 완료 — DB 논문 매칭: " + m["structure_id"]) if m \
+                else "업로드 완료 (DB 매칭 없음 — DOI 로 참조 추가하면 매칭 정확도↑)"
+        except Exception as ex:
+            self.pg_status = "저장 실패: " + str(ex)[:120]
+        finally:
+            self._pending_pg_paper_path = ""
+            self._pending_pg_paper_title = ""
+
+    @rx.event
     def delete_pg_paper_event(self, paper_id: int):
         try:
             pgdb.delete_playground_paper(paper_id)
@@ -1795,8 +1869,21 @@ def _pg_papers_panel() -> rx.Component:
                      on_change=State.set_pg_paper_title, size="1", flex_grow="1"),
             rx.input(placeholder="DOI(선택)", value=State.pg_paper_doi,
                      on_change=State.set_pg_paper_doi, size="1", width="140px"),
-            rx.button("추가", size="1", variant="soft",
+            rx.button("참조 추가", size="1", variant="soft",
                       on_click=State.add_pg_paper_ref),
+            rx.el.label(
+                rx.hstack(
+                    rx.cond(State.pg_uploading, rx.spinner(size="1"), rx.icon("file-up", size=13)),
+                    rx.text("PDF 업로드", size="1"),
+                    spacing="1", align="center",
+                ),
+                rx.el.input(type="file", id="pg_paper_input", accept="application/pdf",
+                            on_change=State.start_pg_paper_upload,
+                            style={"display": "none"}),
+                style={"display": "inline-flex", "alignItems": "center",
+                       "border": "1px solid var(--gray-6)", "borderRadius": "6px",
+                       "padding": "0.25rem 0.6rem", "cursor": "pointer"},
+            ),
             width="100%", spacing="2", align="center", wrap="wrap",
         ),
         spacing="2", width="100%", align="start",
