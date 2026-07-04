@@ -1096,21 +1096,28 @@ class State(rx.State):
             self.pg_chatting = True
             self.pg_input = ""
             self.pg_status = "답변 생성 중…"
+            # 사용자 메시지를 DB 에 저장(실패 시 조용히 넘기지 말고 알림 + 중단)
             try:
                 pgdb.add_message(pid, "user", text_in)
                 self.pg_messages = pgdb.get_messages(pid)
                 self.pg_show_raw = True
-            except Exception:
-                pass
+            except Exception as e:
+                self.pg_chatting = False
+                self.pg_input = text_in   # 입력 복원(유실 방지)
+                self.pg_status = f"저장 실패 — 메시지가 저장되지 않았습니다: {str(e)[:120]}"
+                return
         answer = await asyncio.to_thread(self._do_pg_chat, pid)
         async with self:
+            saved = True
             try:
                 pgdb.add_message(pid, "assistant", answer)
                 self.pg_messages = pgdb.get_messages(pid)
-            except Exception:
-                pass
+            except Exception as e:
+                saved = False
+                self.pg_status = f"답변 저장 실패(화면에는 보이나 미저장): {str(e)[:120]}"
             self.pg_chatting = False
-            self.pg_status = ""
+            if saved:
+                self.pg_status = ""
             self._reload_playgrounds()
 
     @rx.event(background=True)
