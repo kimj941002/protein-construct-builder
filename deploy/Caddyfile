@@ -4,9 +4,14 @@
 # 사용: caddy run --config deploy/Caddyfile
 
 :8080 {
-    # 백엔드(웹소켓/이벤트/업로드/헬스)는 Reflex 백엔드(8000)로
-    @backend path /_event* /_upload* /ping
-    reverse_proxy @backend localhost:8000
+    # 백엔드(웹소켓/이벤트/업로드/헬스/라우트)는 Reflex 백엔드(8000)로.
+    # Reflex 프론트가 호출하는 백엔드 경로 전부 포함해야 연결이 된다.
+    @backend path /_event* /_upload* /ping /_health /_all_routes /auth-codespace*
+    reverse_proxy @backend localhost:8000 {
+        # 웹소켓 업그레이드 헤더 전달
+        header_up Host {host}
+        header_up X-Forwarded-For {remote_host}
+    }
 
     # 그 외 전부는 프론트엔드(3000)로
     reverse_proxy localhost:3000
