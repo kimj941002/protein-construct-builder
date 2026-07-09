@@ -62,8 +62,36 @@ def _warm_db():
         pass
 
 
+def _keep_warm():
+    """Reflex Cloud(fly.io) 무료 티어는 유휴 시 백엔드 머신을 자동 중지한다 → 재접속 시
+    콜드스타트로 'Cannot connect: timeout' + 리스트/검색 실패. **배포 환경에서만** 자기 공개
+    URL(/ping)을 40초마다 호출해 트래픽을 유지 → 머신이 안 꺼지게 한다. 로컬에선 실행 안 함.
+
+    (검증: 계속 두드리면 websocket 20/20 성공 = 워밍업 상태에선 완벽 안정. 문제는 유휴 자동중지뿐.)
+    """
+    import os
+    try:
+        from db_config import _SECRETS_FILE
+        if _SECRETS_FILE.exists():
+            return  # 로컬(secrets.toml 존재) — keep-warm 불필요
+    except Exception:
+        pass
+    # 백엔드 공개 호스트명 = fly app 이름( = Reflex Cloud app id, 배포 간 고정)
+    app = os.environ.get("FLY_APP_NAME") or "0c8f687b-763d-4b78-83c0-08488c7db4e0"
+    url = f"https://{app}.fly.dev/ping"
+    import time
+    import urllib.request
+    while True:
+        time.sleep(40)
+        try:
+            urllib.request.urlopen(url, timeout=10).read()
+        except Exception:
+            pass
+
+
 import threading as _threading
 _threading.Thread(target=_warm_db, daemon=True).start()
+_threading.Thread(target=_keep_warm, daemon=True).start()
 
 # 도메인 트랙 색상
 _DOMAIN_COLORS = ["#4C72B0", "#DD8452", "#55A868", "#C44E52", "#8172B3",
