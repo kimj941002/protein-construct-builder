@@ -6,7 +6,9 @@ from __future__ import annotations
 import base64
 import io
 import os
+import shutil
 import subprocess
+import tempfile
 from datetime import datetime
 
 import anthropic
@@ -17,6 +19,7 @@ from st_aggrid import AgGrid, DataReturnMode, GridOptionsBuilder, GridUpdateMode
 from complex_fetcher import process_complex
 from config import PAPERS_DIR, RCSB_ENTRY_API
 from database import (
+    checkpoint_wal,
     get_all_proteins,
     get_all_chains_by_structure,
     get_domains_by_uniprot,
@@ -45,61 +48,192 @@ from uniprot_fetcher import fetch_protein, load_sequence_from_file, normalize_ge
 from utils import api_call_with_retry, create_cached_session
 
 # ─────────────────────────────────────────────
-# 앱 시작 시 DB 마이그레이션
+# 페이지 설정 (다른 모든 st 명령보다 먼저 호출해야 합니다)
 # ─────────────────────────────────────────────
-migrate_database()
+st.set_page_config(
+    page_title="Protein Construct Builder",
+    page_icon="🧬",
+    layout="wide",
+)
+
+# ─────────────────────────────────────────────
+# DB 자동 GitHub 저장 (배포와 분리된 데이터 전용 브랜치)
+# ─────────────────────────────────────────────
+# [끊김 원인] 예전 구현은 protein_data.db를 origin/main 에 직접 push 했습니다.
+#   Streamlit Cloud는 배포 브랜치(main)에 push가 들어오면 앱을 자동 재배포하므로,
+#   데이터를 저장할 때마다 앱이 스스로를 재시작시켰습니다. 이것이 수집 도중
+#   "데이터베이스가 끊기는" 증상의 정체입니다.
+#   또한 실행 중 `git checkout main` 으로 브랜치를 강제 전환해 작업 트리를 덮어썼습니다.
+#
+# [수정] 데이터는 배포와 무관한 별도 브랜치(기본 db-data)에만 저장합니다.
+#   - 배포 브랜치가 아니므로 재배포가 발생하지 않습니다
+#   - git plumbing(commit-tree)으로 커밋을 만들어 작업 트리·인덱스·현재 브랜치를
+#     전혀 건드리지 않습니다
+#   - 커밋 직전 WAL 체크포인트로 최근 저장분 누락을 막습니다
+#   - 부팅 시 같은 브랜치에서 DB를 복원해, 컨테이너가 재시작돼도 데이터가 남습니다
+#
+# 환경변수:
+#   DB_AUTO_SYNC=0      → 자동 저장·복원을 완전히 끕니다 (읽기 전용 배포용)
+#   DB_SYNC_BRANCH=이름 → 데이터 브랜치 이름 변경 (기본 db-data)
+
+_BASE_DIR      = os.path.dirname(os.path.abspath(__file__))
+DB_SYNC_BRANCH = os.environ.get("DB_SYNC_BRANCH", "db-data")
+DB_SYNC_FILES  = ["protein_data.db", "sequences"]
+PUSH_MAX_ATTEMPTS = 3      # 동시 저장 시 원격 ref 경합 재시도 횟수
+_SYNC_MARKER   = os.path.join(_BASE_DIR, ".db_sync_state")
 
 
-# ─────────────────────────────────────────────
-# DB 자동 GitHub 저장
-# ─────────────────────────────────────────────
+def _db_sync_enabled() -> bool:
+    """DB 자동 동기화 사용 여부."""
+    flag = os.environ.get("DB_AUTO_SYNC")
+    if flag is not None:
+        return flag.strip().lower() not in ("0", "false", "no", "off")
+    return True
+
+
+def _git(*args, check: bool = True, env: dict | None = None):
+    """저장소 루트에서 git 명령을 실행합니다."""
+    return subprocess.run(
+        ["git", *args], cwd=_BASE_DIR, check=check,
+        capture_output=True, text=True,
+        env={**os.environ, **(env or {})},
+    )
+
+
+def _read_marker() -> str:
+    """마지막으로 복원·저장한 데이터 브랜치 커밋 SHA."""
+    try:
+        return open(_SYNC_MARKER, encoding="utf-8").read().strip()
+    except OSError:
+        return ""
+
+
+def _write_marker(rev: str) -> None:
+    try:
+        with open(_SYNC_MARKER, "w", encoding="utf-8") as f:
+            f.write(rev)
+    except OSError:
+        pass
+
+
+def _push_attempt(gene_name: str, label: str) -> bool | None:
+    """
+    데이터 브랜치에 1회 저장 시도.
+    반환값: True(저장함) / False(변경없음) / None(원격 ref 경합 → 재시도 필요)
+    """
+    # 임시 인덱스는 호출마다 고유해야 합니다. Streamlit은 세션마다 별도 스레드로
+    # 같은 프로세스에서 스크립트를 실행하므로, 고정 경로를 쓰면 동시 수집 시
+    # 두 세션이 같은 인덱스와 index.lock 을 두고 충돌합니다.
+    tmp_dir   = tempfile.mkdtemp(prefix="pcb-index-")
+    env = {"GIT_INDEX_FILE": os.path.join(tmp_dir, "index")}
+    try:
+        # 원격 데이터 브랜치를 부모로 사용합니다 (없으면 부모 없는 최초 커밋)
+        parent = ""
+        if _git("fetch", "origin", DB_SYNC_BRANCH, check=False).returncode == 0:
+            rev = _git("rev-parse", "FETCH_HEAD", check=False)
+            if rev.returncode == 0:
+                parent = rev.stdout.strip()
+
+        # 임시 인덱스에만 작업합니다 → 실제 인덱스/작업 트리 영향 없음
+        _git("read-tree", parent or "--empty", env=env)
+        _git("add", "--", *DB_SYNC_FILES, env=env)
+        tree = _git("write-tree", env=env).stdout.strip()
+
+        # 부모와 내용이 같으면 커밋하지 않습니다
+        if parent:
+            parent_tree = _git("rev-parse", f"{parent}^{{tree}}",
+                               check=False).stdout.strip()
+            if tree == parent_tree:
+                return False
+
+        msg = f"data: {gene_name} {label}자동 저장".strip()
+        args = ["commit-tree", tree] + (["-p", parent] if parent else []) + ["-m", msg]
+        commit = _git(*args).stdout.strip()
+
+        pushed = _git("push", "origin", f"{commit}:refs/heads/{DB_SYNC_BRANCH}",
+                      check=False)
+        if pushed.returncode != 0:
+            # 다른 세션이 먼저 같은 브랜치를 갱신했으면 새 부모로 다시 시도합니다
+            if "cannot lock ref" in pushed.stderr or "non-fast-forward" in pushed.stderr \
+               or "fetch first" in pushed.stderr:
+                return None
+            raise subprocess.CalledProcessError(
+                pushed.returncode, pushed.args, pushed.stdout, pushed.stderr)
+
+        _write_marker(commit)
+        print(f"[OK] origin/{DB_SYNC_BRANCH} 저장 완료: {msg}")
+        return True
+    finally:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
 def _git_push_db(gene_name: str, label: str = "") -> bool:
     """
-    protein_data.db와 sequences/ 변경분을 origin/main에 commit & push합니다.
-    반환값: True(성공) / False(변경없음 또는 실패)
+    protein_data.db와 sequences/ 를 origin/<DB_SYNC_BRANCH> 에 저장합니다.
+    현재 브랜치·작업 트리·인덱스를 건드리지 않으므로 앱이 재시작되지 않습니다.
+
+    반환값: True(저장함) / False(변경없음 또는 실패)
     """
-    base = os.path.dirname(os.path.abspath(__file__))
+    if not _db_sync_enabled():
+        return False
+
+    # WAL에 남은 변경분을 .db 본체로 내려야 커밋에 최근 데이터가 포함됩니다
+    checkpoint_wal()
+
     try:
-        # 브랜치가 main이 아니면 main으로 전환
-        cur_branch = subprocess.run(
-            ["git", "rev-parse", "--abbrev-ref", "HEAD"],
-            cwd=base, check=True, capture_output=True, text=True,
-        ).stdout.strip()
-
-        if cur_branch != "main":
-            subprocess.run(["git", "fetch", "origin", "main"],
-                           cwd=base, check=True, capture_output=True)
-            subprocess.run(["git", "checkout", "main"],
-                           cwd=base, check=True, capture_output=True)
-            subprocess.run(["git", "pull", "origin", "main"],
-                           cwd=base, check=True, capture_output=True)
-
-        # DB·시퀀스 스테이징
-        subprocess.run(["git", "add", "protein_data.db", "sequences/"],
-                       cwd=base, check=True, capture_output=True)
-
-        # 변경 없으면 생략
-        diff = subprocess.run(["git", "diff", "--cached", "--quiet"],
-                              cwd=base, capture_output=True)
-        if diff.returncode == 0:
-            return False
-
-        # commit 메시지 구성
-        msg = f"data: {gene_name} {label}자동 저장".strip()
-        subprocess.run(["git", "commit", "-m", msg],
-                       cwd=base, check=True, capture_output=True)
-        subprocess.run(["git", "push", "origin", "main"],
-                       cwd=base, check=True, capture_output=True)
-
-        print(f"[OK] GitHub origin/main 저장 완료: {msg}")
-        return True
-
+        for _ in range(PUSH_MAX_ATTEMPTS):
+            result = _push_attempt(gene_name, label)
+            if result is not None:
+                return result
+        print(f"[WARN] {DB_SYNC_BRANCH} 경합이 계속되어 저장을 건너뜁니다 ({gene_name}).")
+        return False
     except subprocess.CalledProcessError as e:
         stderr = (e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes)
                   else str(e.stderr or e))
         print(f"[WARN] GitHub 저장 실패 ({gene_name}): {stderr}")
         st.warning(f"⚠️ GitHub 저장 실패: {stderr[:200]}")
         return False
+
+
+@st.cache_resource(show_spinner=False)
+def _restore_db_from_branch() -> str | None:
+    """
+    부팅 시 origin/<DB_SYNC_BRANCH> 의 최신 DB를 내려받습니다.
+    Streamlit Cloud처럼 파일시스템이 휘발성인 환경에서 재시작 후에도
+    수집한 데이터가 유지됩니다. 앱 프로세스당 1회만 실행됩니다.
+    """
+    if not _db_sync_enabled():
+        return None
+    try:
+        if _git("fetch", "origin", DB_SYNC_BRANCH, check=False).returncode != 0:
+            return None                      # 데이터 브랜치가 아직 없음 (최초 실행)
+
+        rev = _git("rev-parse", "FETCH_HEAD", check=False).stdout.strip()
+        if not rev or rev == _read_marker():
+            return None                      # 이미 이 버전을 갖고 있음
+
+        # 최초 동기화 전인데 로컬 DB에 미커밋 변경이 있으면 덮어쓰지 않습니다
+        if not _read_marker():
+            dirty = _git("status", "--porcelain", "--", *DB_SYNC_FILES, check=False)
+            if dirty.stdout.strip():
+                print("[INFO] 로컬 DB에 미커밋 변경이 있어 복원을 건너뜁니다.")
+                return None
+
+        _git("checkout", rev, "--", *DB_SYNC_FILES)
+        _git("reset", "--quiet", "HEAD", "--", *DB_SYNC_FILES, check=False)
+        _write_marker(rev)
+        print(f"[OK] origin/{DB_SYNC_BRANCH}({rev[:7]}) 에서 DB 복원 완료")
+        return rev
+    except subprocess.CalledProcessError as e:
+        print(f"[WARN] DB 복원 실패: {e}")
+        return None
+
+
+# ─────────────────────────────────────────────
+# 앱 시작: DB 복원 → 마이그레이션 (순서 중요)
+# ─────────────────────────────────────────────
+_restore_db_from_branch()
+migrate_database()
 
 
 # ─────────────────────────────────────────────
@@ -110,15 +244,6 @@ if "uniprot_id" not in st.session_state:
     if _last_uid and get_protein(_last_uid):
         st.session_state["uniprot_id"] = _last_uid
         st.session_state["protein_data"] = None
-
-# ─────────────────────────────────────────────
-# 페이지 설정
-# ─────────────────────────────────────────────
-st.set_page_config(
-    page_title="Protein Construct Builder",
-    page_icon="🧬",
-    layout="wide",
-)
 
 # ─────────────────────────────────────────────
 # 서열 포매터
@@ -656,9 +781,10 @@ if search_clicked and query.strip():
     c3.metric("Sequence Len", f"{protein_data['sequence_length']} aa")
     c4.metric("PDB 구조 수",  f"{len(pdb_ids)}개")
 
-    # ── 조기 저장: UniProt 수집 직후 즉시 GitHub push ──────────
-    # PDB 수집 도중 reboot 돼도 단백질 기본 정보는 보존됨
-    with st.spinner("단백질 정보 GitHub 저장 중..."):
+    # ── 조기 저장: UniProt 수집 직후 데이터 브랜치에 저장 ──────────
+    # PDB 수집 도중 재시작돼도 단백질 기본 정보는 보존됨.
+    # 배포 브랜치가 아닌 db-data 브랜치로 나가므로 앱이 재배포되지 않음.
+    with st.spinner(f"단백질 정보 저장 중... ({DB_SYNC_BRANCH} 브랜치)"):
         _git_push_db(protein_data["gene_name"], label="기본정보 ")
 
     with st.expander("아미노산 서열 보기"):
@@ -737,11 +863,13 @@ if search_clicked and query.strip():
     st.session_state.pop("ai_selected_chat_id", None)
     save_last_selected_protein(protein_data["uniprot_id"])
 
-    # ── 최종 저장: 전체 파이프라인 완료 후 GitHub push ──────────
-    with st.spinner("전체 데이터 GitHub 최종 저장 중..."):
+    # ── 최종 저장: 전체 파이프라인 완료 후 데이터 브랜치에 저장 ──────────
+    with st.spinner(f"전체 데이터 최종 저장 중... ({DB_SYNC_BRANCH} 브랜치)"):
         pushed = _git_push_db(protein_data["gene_name"], label="전체 수집 완료 ")
     if pushed:
-        st.success(f"✅ {protein_data['gene_name']} 데이터가 GitHub에 저장되었습니다.")
+        st.success(
+            f"✅ {protein_data['gene_name']} 데이터가 origin/{DB_SYNC_BRANCH} 에 저장되었습니다."
+        )
     st.rerun()
 
 

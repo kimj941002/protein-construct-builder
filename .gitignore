@@ -2,6 +2,13 @@
 # (로컬에서 데이터 수집 후 GitHub에 푸시 → Streamlit Cloud에서 읽기 전용 사용)
 # protein_data.db  ← 주석 처리: GitHub에 올려야 함
 
+# SQLite WAL 사이드카 파일 (WAL 모드에서 런타임 생성 — 커밋 금지)
+protein_data.db-wal
+protein_data.db-shm
+
+# DB 동기화 마커 (로컬 전용 런타임 파일)
+.db_sync_state
+
 # API 캐시 파일
 protein_api_cache.sqlite
 

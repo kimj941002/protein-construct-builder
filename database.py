@@ -16,14 +16,137 @@ from __future__ import annotations
 import sqlite3
 import json
 import os
+import time
+import threading
+from contextlib import contextmanager
 from config import DB_PATH, SEQUENCES_DIR
 
 
-def get_connection():
-    """데이터베이스 연결을 반환합니다."""
-    conn = sqlite3.connect(DB_PATH)
+# ═══════════════════════════════════════════
+# 0. 연결 관리 (잠금·끊김 방지)
+# ═══════════════════════════════════════════
+# 연결이 "끊기는" 증상의 대부분은 SQLite 기본값 때문입니다.
+#   - busy timeout 기본값이 0초라, 다른 요청이 쓰는 중이면 기다리지 않고
+#     즉시 "database is locked" 예외를 던집니다.
+#   - 기본 journal 모드(DELETE)에서는 읽기와 쓰기가 서로를 차단합니다.
+# 아래 설정으로 두 가지를 모두 해소합니다.
+
+CONNECT_TIMEOUT  = 30.0    # sqlite3 드라이버가 잠금 해제를 기다리는 시간 (초)
+BUSY_TIMEOUT_MS  = 30000   # SQLite 내부 busy handler 대기 시간 (밀리초)
+MAX_LOCK_RETRIES = 5       # 잠금 예외 발생 시 재시도 횟수
+RETRY_BASE_DELAY = 0.1     # 재시도 대기 기준값 (지수 백오프)
+
+_PARAM_UNSET = object()
+_journal_lock = threading.Lock()
+_journal_ready = False
+
+
+def _is_lock_error(exc: Exception) -> bool:
+    """재시도로 회복 가능한 일시적 잠금 오류인지 판별합니다."""
+    msg = str(exc).lower()
+    return "locked" in msg or "busy" in msg
+
+
+class ResilientConnection(sqlite3.Connection):
+    """
+    일시적인 잠금(database is locked / busy)을 지수 백오프로 자동 재시도하는 연결입니다.
+    기존 호출부(conn.execute(...))를 그대로 둔 채 끊김만 사라지게 합니다.
+    """
+
+    def _retry(self, func, *args):
+        last_exc = None
+        for attempt in range(MAX_LOCK_RETRIES):
+            try:
+                return func(*args)
+            except sqlite3.OperationalError as exc:
+                if not _is_lock_error(exc):
+                    raise
+                last_exc = exc
+                time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+        raise last_exc
+
+    def execute(self, sql, parameters=_PARAM_UNSET):
+        if parameters is _PARAM_UNSET:
+            return self._retry(super().execute, sql)
+        return self._retry(super().execute, sql, parameters)
+
+    def executemany(self, sql, parameters):
+        return self._retry(super().executemany, sql, parameters)
+
+    def commit(self):
+        return self._retry(super().commit)
+
+
+def _apply_pragmas(conn: sqlite3.Connection) -> None:
+    """연결마다 잠금 대기·동시성 설정을 적용합니다."""
+    global _journal_ready
+
+    # busy_timeout: 잠금이 풀릴 때까지 기다립니다 (기본 0 → 즉시 실패)
+    conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+    conn.execute("PRAGMA foreign_keys = ON")
+
+    # WAL: 읽기와 쓰기가 서로를 차단하지 않게 합니다 (DB 파일당 1회면 충분)
+    if not _journal_ready:
+        with _journal_lock:
+            if not _journal_ready:
+                try:
+                    conn.execute("PRAGMA journal_mode = WAL").fetchone()
+                    conn.execute("PRAGMA synchronous = NORMAL")
+                except sqlite3.DatabaseError as exc:
+                    # 네트워크 드라이브 등 WAL 미지원 환경에서는 기본 모드로 진행
+                    print(f"[WARN] WAL 모드 설정 실패, 기본 모드로 진행합니다: {exc}")
+                _journal_ready = True
+
+
+def get_connection() -> ResilientConnection:
+    """데이터베이스 연결을 반환합니다. (잠금 자동 재시도 포함)"""
+    conn = sqlite3.connect(
+        DB_PATH,
+        timeout=CONNECT_TIMEOUT,
+        check_same_thread=False,   # Streamlit 재실행 스레드에서도 사용 가능
+        factory=ResilientConnection,
+    )
     conn.row_factory = sqlite3.Row
+    _apply_pragmas(conn)
     return conn
+
+
+@contextmanager
+def db_session(commit: bool = False):
+    """
+    예외가 발생해도 연결을 반드시 닫는 컨텍스트 매니저입니다.
+
+        with db_session(commit=True) as conn:
+            conn.execute(...)
+
+    commit=True면 블록이 정상 종료될 때 commit, 예외 시 rollback합니다.
+    """
+    conn = get_connection()
+    try:
+        yield conn
+        if commit:
+            conn.commit()
+    except Exception:
+        if commit:
+            try:
+                conn.rollback()
+            except sqlite3.Error:
+                pass
+        raise
+    finally:
+        conn.close()
+
+
+def checkpoint_wal() -> None:
+    """
+    WAL에 남아있는 변경분을 protein_data.db 본체로 밀어 넣습니다.
+    DB 파일을 git에 커밋하기 직전에 반드시 호출해야 최근 저장분이 누락되지 않습니다.
+    """
+    try:
+        with db_session() as conn:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    except sqlite3.Error as exc:
+        print(f"[WARN] WAL 체크포인트 실패: {exc}")
 
 
 def init_database():

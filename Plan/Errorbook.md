@@ -399,3 +399,69 @@ if event.selection.rows:
 ### 예방 규칙
 > **`st.dataframe(on_select="rerun")` 사용 시 반드시 표시 전에 `df.reset_index(drop=True)` 적용.**
 > `event.selection.rows`는 화면 표시 순서 기준이므로 원본 DataFrame 인덱스와 다를 수 있음.
+
+---
+
+## ERROR-012: 데이터 수집 중 DB 연결 끊김 (자기 재배포 + SQLite 잠금)
+
+**발생 파일:** `app.py` (`_git_push_db`), `database.py` (`get_connection`), `llm_query.py` (`execute_sql`)
+**발생 일시:** 2026-09-22
+
+### 오류 내용
+단백질 데이터를 수집하는 도중 앱이 재시작되거나 다음 예외가 발생함.
+```
+sqlite3.OperationalError: database is locked
+```
+수집한 데이터가 저장되지 않고 사라지는 현상이 함께 나타남.
+
+### 원인 (3가지가 겹침)
+
+**1. 앱이 스스로를 재배포시킴 (주원인)**
+`_git_push_db()`가 `protein_data.db`를 **배포 브랜치인 `origin/main`에 직접 push**했음.
+Streamlit Cloud는 배포 브랜치에 push가 들어오면 앱을 자동 재배포하므로,
+데이터를 저장할 때마다 앱이 그 자리에서 재시작됨 = "DB가 끊기는" 증상.
+또한 실행 중 `git checkout main`으로 브랜치를 강제 전환해 작업 트리를 덮어썼음.
+
+**2. SQLite busy timeout 기본값이 0**
+`sqlite3.connect(DB_PATH)`는 busy timeout이 0초라, 다른 요청이 쓰는 중이면
+기다리지 않고 즉시 `database is locked`를 던짐. 기본 journal 모드(DELETE)에서는
+읽기와 쓰기가 서로를 차단해 확률이 더 높아짐.
+
+**3. 예외 경로에서 연결 누수**
+`llm_query.execute_sql()`이 `conn.close()`를 `try` 블록 안에 두어,
+`execute()`가 실패하면 연결이 닫히지 않고 누적됨.
+
+### 해결 방법
+
+**1. 데이터를 배포와 분리된 전용 브랜치(`db-data`)에 저장**
+- git plumbing(`read-tree` → `write-tree` → `commit-tree` → `push <sha>:refs/heads/db-data`)으로
+  커밋을 만들어 **작업 트리·인덱스·현재 브랜치를 전혀 건드리지 않음**
+- 배포 브랜치가 아니므로 재배포가 발생하지 않음
+- 부팅 시 `_restore_db_from_branch()`가 같은 브랜치에서 DB를 복원 → 컨테이너 재시작에도 데이터 유지
+- 임시 인덱스는 `tempfile.mkdtemp()`로 호출마다 고유하게 (Streamlit은 세션마다 별도 스레드)
+
+**2. 연결 설정 강화 (`database.get_connection`)**
+```python
+sqlite3.connect(DB_PATH, timeout=30.0, check_same_thread=False,
+                factory=ResilientConnection)
+# PRAGMA busy_timeout = 30000
+# PRAGMA journal_mode = WAL      ← 읽기/쓰기 상호 차단 해소
+# PRAGMA synchronous = NORMAL
+```
+`ResilientConnection`이 잠금 오류를 지수 백오프로 자동 재시도함.
+
+**3. WAL 체크포인트를 커밋 직전에 실행**
+WAL 모드에서는 최근 쓰기가 `protein_data.db-wal`에 남아있어,
+체크포인트 없이 `.db`만 커밋하면 **최근 데이터가 누락됨**. `checkpoint_wal()`을 push 직전 호출.
+`protein_data.db-wal` / `-shm`은 `.gitignore`에 추가 (커밋 금지).
+
+### 예방 규칙
+> **실행 중인 앱이 자신의 배포 브랜치에 push하지 않는다.** 런타임 데이터는 배포와 분리된
+> 전용 브랜치에 저장하고, 작업 트리를 바꾸는 `git checkout` / `git pull`을 앱 코드에서 실행하지 않는다.
+>
+> **SQLite 연결은 반드시 `database.get_connection()` 또는 `database.db_session()`을 통해 연다.**
+> `sqlite3.connect()`를 직접 호출하면 busy timeout·WAL 설정이 빠져 잠금 오류가 재발한다.
+>
+> **연결을 닫는 코드는 `finally`에 둔다.** `db_session()` 컨텍스트 매니저를 쓰면 자동 보장된다.
+>
+> **WAL 모드 DB 파일을 git에 커밋하기 전에는 반드시 `checkpoint_wal()`을 호출한다.**

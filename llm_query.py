@@ -7,11 +7,10 @@ from __future__ import annotations
 import json
 import os
 import time
-import sqlite3
 
 import anthropic
 
-from config import DB_PATH
+from database import db_session
 
 # ─────────────────────────────────────────────
 # DB 스키마 설명 (시스템 프롬프트용)
@@ -121,10 +120,12 @@ def execute_sql(sql: str) -> tuple[list[dict], str | None]:
     if not (upper.startswith("SELECT") or upper.startswith("WITH")):
         return [], "보안 정책: SELECT 또는 WITH 쿼리만 허용됩니다."
     try:
-        conn = sqlite3.connect(DB_PATH)
-        conn.row_factory = sqlite3.Row
-        rows = [dict(r) for r in conn.execute(stripped).fetchall()]
-        conn.close()
+        # database.db_session: busy_timeout·WAL·잠금 재시도가 적용된 연결을 쓰고,
+        # 쿼리가 실패해도 finally에서 반드시 닫습니다.
+        # (기존 코드는 execute() 실패 시 conn.close()에 도달하지 못해 연결이 새어
+        #  누적되면 "database is locked"로 이어졌습니다.)
+        with db_session() as conn:
+            rows = [dict(r) for r in conn.execute(stripped).fetchall()]
         return rows, None
     except Exception as exc:
         return [], str(exc)
